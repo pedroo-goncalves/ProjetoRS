@@ -1,1 +1,111 @@
-proto
+syntax = "proto3";
+
+package battleship;
+
+// MVP: apenas o necessário para dois jogadores jogarem um contra o outro.
+// Fluxo: Invite → Ready (ambos) → Attack (turnos alternados) → WIN
+
+
+// ═══════════════════════════════════════════════════════════════════
+// SERVIÇO: BattleshipGame
+// ═══════════════════════════════════════════════════════════════════
+service BattleshipGame {
+  rpc Invite(InviteRequest) returns(InviteResponse);
+  rpc Ready(ReadyMessage) returns(ReadyAck);
+  rpc Attack(AttackRequest) returns(AttackResponse);
+  rpc Forfeit(ForfeitRequest) returns(ForfeitAck);
+  rpc Heartbeat(HeartbeatRequest) returns(HeartbeatResponse);
+}
+
+message InviteRequest {
+  string from_id = 1;
+  string from_addr = 2;  // "ip:porta" — B precisa para responder antes de ter DHT
+  string game_id = 3;
+}
+
+message InviteResponse {
+  bool accepted = 1;
+  string reason = 2;
+}
+
+// Sinaliza que o jogador terminou de colocar os navios.
+// A partida só começa quando ambos enviarem Ready.
+message ReadyMessage {
+  string player_id = 1;
+  string game_id = 2;
+}
+
+message ReadyAck {
+  bool ok = 1;
+}
+
+message AttackRequest {
+  string attacker_id = 1;
+  int32 row = 2;
+  int32 col = 3;
+  string game_id = 4;
+}
+
+message ForfeitRequest {
+  string player_id = 1;
+  string game_id   = 2;
+}
+
+message ForfeitAck {
+  bool ok = 1;
+}
+
+message HeartbeatRequest {
+  string player_id = 1;
+  string game_id = 2;
+}
+
+message HeartbeatResponse {
+  bool ok = 1;
+}
+
+message AttackResponse {
+  enum Result {
+    MISS = 0;
+    HIT = 1;
+    SUNK = 2;
+    WIN = 3;  // WIN = último navio afundado; não é preciso contar navios no cliente
+  }
+
+  Result result = 1;
+  string ship_name = 2;  // vazio se MISS
+  bool game_over = 3;
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+// SERVIÇO: DHTNode
+// Subconjunto mínimo de Kademlia para descobrir de jogadores.
+// ═══════════════════════════════════════════════════════════════════
+service DHTNode {
+  rpc Ping(PingRequest) returns (PingResponse);
+  rpc Store(StoreRequest) returns (StoreResponse);
+  rpc FindNode(FindNodeRequest) returns (FindNodeResponse);
+}
+
+// node_id = SHA-1("ip:porta") em hex
+message NodeInfo {
+  string node_id = 1;
+  string address = 2;  // "ip:porta"
+}
+
+message PingRequest { string sender_id = 1; }
+message PingResponse { string sender_id = 1; }
+
+message StoreRequest { string node_id = 1; string address = 2; }
+message StoreResponse { bool ok = 1; }
+
+message FindNodeRequest {
+  string target_id = 1;
+  NodeInfo sender = 2;
+}
+
+message FindNodeResponse {
+  repeated NodeInfo closest_nodes = 1;
+  NodeInfo exact_match = 2;  // preenchido se encontrado exactamente
+}
