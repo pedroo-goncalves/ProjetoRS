@@ -1,5 +1,10 @@
-up:
-    docker compose up --build
+.PHONY: broker stop logs
 
-down:
-    docker compose down
+broker:
+	docker compose up -d
+
+stop:
+	docker compose down
+
+logs:
+	docker compose logs -f
