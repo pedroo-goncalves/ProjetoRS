@@ -1,1 +1,2 @@
-....
+aioconsole
+paho-mqtt
