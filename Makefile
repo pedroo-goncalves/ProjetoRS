@@ -1,4 +1,4 @@
-.PHONY: broker stop logs
+.PHONY: broker stop logs test
 
 broker:
 	docker compose up -d
@@ -8,3 +8,6 @@ stop:
 
 logs:
 	docker compose logs -f
+
+test:
+	python -m pytest tests/tests.py -v
