@@ -1,5 +1,5 @@
-from types import Cell
-from ship import Ship
+from .types import Cell
+from .ship import Ship
 
 from dataclasses import dataclass
 
@@ -10,34 +10,42 @@ class board:
     ships: list[Ship]
 
     def place_ship(self, ship:Ship) -> None:      
-        if self.validate_placement():
+        if self.validate_placement(ship):
             self.ships.append(ship)
 
 
     def register_shot(self, x:int,y:int) -> tuple[str, str | None, bool]:
         for ship in self.ships:
+            # Check if ship was already sunken before shot
+            was_sunk = ship.is_sunk()
 
             if ship.register_hit(Cell(x,y)):
-                return ("hit", ship.name, self.is_game_over())
+                if was_sunk:
+                    return ("miss", None, False)
+
+                if ship.is_sunk():
+                    return ("sunk", ship.name, self.is_game_over())
+
+                return ("hit", ship.name, False)
             
         return ("miss", None, False)
 
 
     # HELPER FUNCTIONS
     def validate_placement(self, ship:Ship) -> bool:
-        return self._is_in_bounds() and not self._is_overlapping()
+        return self._is_in_bounds(ship) and not self._is_overlapping(ship)
 
 
     def _is_in_bounds(self, ship:Ship) -> bool:
 
         for position in ship.position:
-            # Unwrap cell tuple
+            # Unpack cell tuple
             x,y = position
 
-            if x < 0 or x > GRID_SIZE:
+            if x < 0 or x >= GRID_SIZE:
                 return False
         
-            if y < 0 or y > GRID_SIZE:
+            if y < 0 or y >= GRID_SIZE:
                 return False
         
         return True

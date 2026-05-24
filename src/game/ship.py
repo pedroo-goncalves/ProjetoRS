@@ -1,4 +1,4 @@
-from types import Cell
+from .types import Cell
 from dataclasses import dataclass, field
 
 @dataclass

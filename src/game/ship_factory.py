@@ -1,5 +1,5 @@
-from types import Cell
-from ship import Ship
+from .types import Cell
+from .ship import Ship
 
 # SOURCE: https://en.wikipedia.org/wiki/Battleship_(game)
 FLEET = {
