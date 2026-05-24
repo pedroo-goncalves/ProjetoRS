@@ -5,6 +5,7 @@ import json
 import uuid
 from rich.console import Console
 from rich.text import Text
+from network.tcp_game import run_as_host, run_as_guest
 
 BROKER = "localhost"
 PORT = 1883
@@ -61,16 +62,23 @@ def on_tournament_message(client, userdata, msg):
 
 def on_matchmaking_message(client, userdata, msg, my_id):
     payload = msg.payload.decode()
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        return
 
-    if payload == "clear":
-        matchmaking_queue.clear()
-    else:
-        try:
-            data = json.loads(payload)
-            if data["player_id"] != my_id:
-                matchmaking_queue[data["player_id"]] = data["addr"]
-        except (json.JSONDecodeError, KeyError):
-            pass
+    if data.get("command") == "clear":
+        host_id   = data.get("host_id")
+        host_addr = data.get("host_addr")
+        if host_id != my_id and my_id < host_id:
+            # I'm the guest — save host addr so the loop can connect
+            matchmaking_queue["__host__"] = (host_id, host_addr)
+        else:
+            matchmaking_queue.clear()
+        return
+
+    if data.get("player_id") != my_id:
+        matchmaking_queue[data["player_id"]] = data["addr"]
 
 # ── UI ────────────────────────────────────────────────────────────
 
@@ -127,12 +135,29 @@ async def menu_matchmaking(client: mqtt.Client, player_id: str, my_addr: str):
     try:
         while True:
             await asyncio.sleep(1)
-            if matchmaking_queue:
+            if "__host__" in matchmaking_queue:
+                # Host found us and told us their addr — connect as guest
+                opponent_id, opponent_addr = matchmaking_queue.pop("__host__")
+                console.print(f"[green]Adversário encontrado: {opponent_id}[/]")
+                game_id = f"{min(player_id, opponent_id)}-{max(player_id, opponent_id)}"
+                await run_as_guest(player_id, game_id, opponent_addr)
+                break
+            elif matchmaking_queue:
                 opponent_id, opponent_addr = next(iter(matchmaking_queue.items()))
                 matchmaking_queue.clear()
-                client.publish("naval/matchmaking", "clear")
                 console.print(f"[green]Adversário encontrado: {opponent_id}[/]")
-                # TODO (P1): ligar via TCP a opponent_addr
+                game_id = f"{min(player_id, opponent_id)}-{max(player_id, opponent_id)}"
+                if player_id < opponent_id:
+                    # I'm the guest — connect directly
+                    await run_as_guest(player_id, game_id, opponent_addr)
+                else:
+                    # I'm the host — broadcast my addr and open server
+                    client.publish("naval/matchmaking", json.dumps({
+                        "command": "clear",
+                        "host_id": player_id,
+                        "host_addr": my_addr
+                    }))
+                    await run_as_host(player_id, game_id, int(my_addr.split(":")[1]))
                 break
     finally:
         client.unsubscribe("naval/matchmaking")
@@ -158,7 +183,7 @@ async def menu_1v1(client: mqtt.Client, player_id: str, my_addr: str):
                     client.publish(f"naval/games/{game_id}",
                                    json.dumps({"host": player_id, "addr": my_addr}), retain=True)
                     console.print("[dim]À espera de adversário...[/]")
-                    # TODO (P1): aguardar ligação TCP
+                    await run_as_host(player_id, game_id, int(my_addr.split(":")[1]))
                     break
                 case "2":
                     items = show_games_list(player_id)
@@ -168,7 +193,7 @@ async def menu_1v1(client: mqtt.Client, player_id: str, my_addr: str):
                             game_id, game = items[int(escolha) - 1]
                             client.publish(f"naval/games/{game_id}", "closed", retain=True)
                             console.print(f"[green]A entrar na partida de {game['host']}[/]")
-                            # TODO (P1): ligar via TCP a game["addr"]
+                            await run_as_guest(player_id, game_id, game["addr"])
                         except (ValueError, IndexError):
                             console.print("[red]Inválido.[/]")
                 case "3":
