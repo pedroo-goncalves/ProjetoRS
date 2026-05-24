@@ -27,9 +27,10 @@ def _coord_str(row: int, col: int) -> str:
 
 # ── Entry points ──────────────────────────────────────────────────
 
+CONNECT_TIMEOUT = 30  # segundos à espera que o guest se ligue
+
 async def run_as_host(player_id: str, game_id: str, port: int) -> None:
     """Open a TCP server, wait for one opponent, then play. Host goes first."""
-    # asyncio.start_server returns immediately; we await the first connection
     conn: asyncio.Future = asyncio.get_event_loop().create_future()
 
     async def on_connect(reader, writer):
@@ -39,8 +40,13 @@ async def run_as_host(player_id: str, game_id: str, port: int) -> None:
     server = await asyncio.start_server(on_connect, "0.0.0.0", port)
     console.print(f"[dim]À espera de ligação TCP na porta {port}…[/]")
 
-    reader, writer = await conn  # block until someone connects
-    server.close()               # stop accepting new connections
+    try:
+        reader, writer = await asyncio.wait_for(conn, timeout=CONNECT_TIMEOUT)
+    except asyncio.TimeoutError:
+        server.close()
+        console.print("[red]Tempo esgotado — adversário não se ligou.[/]")
+        return
+    server.close()
 
     await game_session(reader, writer, player_id, game_id, i_go_first=True)
 
@@ -48,7 +54,11 @@ async def run_as_host(player_id: str, game_id: str, port: int) -> None:
 async def run_as_guest(player_id: str, game_id: str, addr: str) -> None:
     """Connect to host's TCP address, then play. Guest goes second."""
     host, port_str = addr.rsplit(":", 1)
-    reader, writer = await asyncio.open_connection(host, int(port_str))
+    try:
+        reader, writer = await asyncio.open_connection(host, int(port_str))
+    except (ConnectionRefusedError, OSError):
+        console.print("[red]Não foi possível ligar ao adversário.[/]")
+        return
     console.print(f"[green]Ligado a {addr}[/]")
 
     await game_session(reader, writer, player_id, game_id, i_go_first=False)

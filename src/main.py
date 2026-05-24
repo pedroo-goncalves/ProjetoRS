@@ -3,6 +3,7 @@ import aioconsole
 import paho.mqtt.client as mqtt
 import json
 import uuid
+import socket
 from rich.console import Console
 from rich.text import Text
 from network.tcp_game import run_as_host, run_as_guest
@@ -26,6 +27,12 @@ available_tournaments = {}
 matchmaking_queue     = {}
 
 # ── MQTT ──────────────────────────────────────────────────────────
+
+def find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+
 
 def setup_mqtt(player_id: str) -> mqtt.Client:
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, player_id)
@@ -71,10 +78,13 @@ def on_matchmaking_message(client, userdata, msg, my_id):
         host_id   = data.get("host_id")
         host_addr = data.get("host_addr")
         if host_id != my_id and my_id < host_id:
-            # I'm the guest — save host addr so the loop can connect
             matchmaking_queue["__host__"] = (host_id, host_addr)
         else:
             matchmaking_queue.clear()
+        return
+
+    if data.get("command") == "cancel":
+        matchmaking_queue.pop(data.get("player_id"), None)
         return
 
     if data.get("player_id") != my_id:
@@ -128,39 +138,64 @@ def show_tournaments_list(my_id: str):
 # ── Matchmaking ───────────────────────────────────────────────────
 
 async def menu_matchmaking(client: mqtt.Client, player_id: str, my_addr: str):
+    # Countdown visual — sem leitura de stdin, sem threads, sem cancelamento aqui.
+    console.print("[dim]Matchmaking iniciado, a entrar na fila em...[/]", end=" ")
+    for n in range(3, 0, -1):
+        print(n, end=" ", flush=True)
+        await asyncio.sleep(1)
+    print()
+
+    # Entrar na queue. O aioconsole.ainput abaixo é o ÚNICO leitor de stdin
+    # durante todo este fluxo — nunca é cancelado, resolve-se sempre de forma
+    # natural (utilizador prime Enter ou adversário é encontrado e ele confirma).
     client.subscribe("naval/matchmaking")
     client.on_message = make_matchmaking_callback(player_id)
     client.publish("naval/matchmaking", json.dumps({"player_id": player_id, "addr": my_addr}))
-    console.print("[dim]À procura de adversário...[/]")
+    console.print("[dim]À procura de adversário... (Enter para cancelar)[/]")
+
+    cancel_task = asyncio.create_task(aioconsole.ainput(""))
+    found = None
+
     try:
         while True:
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.25)
+            if cancel_task.done():
+                break  # utilizador cancelou
             if "__host__" in matchmaking_queue:
-                # Host found us and told us their addr — connect as guest
-                opponent_id, opponent_addr = matchmaking_queue.pop("__host__")
-                console.print(f"[green]Adversário encontrado: {opponent_id}[/]")
-                game_id = f"{min(player_id, opponent_id)}-{max(player_id, opponent_id)}"
-                await run_as_guest(player_id, game_id, opponent_addr)
+                opp_id, opp_addr = matchmaking_queue.pop("__host__")
+                found = (opp_id, opp_addr, False)
                 break
             elif matchmaking_queue:
-                opponent_id, opponent_addr = next(iter(matchmaking_queue.items()))
+                opp_id, opp_addr = next(iter(matchmaking_queue.items()))
                 matchmaking_queue.clear()
-                console.print(f"[green]Adversário encontrado: {opponent_id}[/]")
-                game_id = f"{min(player_id, opponent_id)}-{max(player_id, opponent_id)}"
-                if player_id < opponent_id:
-                    # I'm the guest — connect directly
-                    await run_as_guest(player_id, game_id, opponent_addr)
-                else:
-                    # I'm the host — broadcast my addr and open server
-                    client.publish("naval/matchmaking", json.dumps({
-                        "command": "clear",
-                        "host_id": player_id,
-                        "host_addr": my_addr
-                    }))
-                    await run_as_host(player_id, game_id, int(my_addr.split(":")[1]))
+                found = (opp_id, opp_addr, player_id > opp_id)
                 break
     finally:
         client.unsubscribe("naval/matchmaking")
+        matchmaking_queue.clear()
+
+    if found is None:
+        client.publish("naval/matchmaking", json.dumps({
+            "command": "cancel",
+            "player_id": player_id,
+        }))
+        console.print("[yellow]Matchmaking cancelado.[/]")
+        return
+
+    opp_id, opp_addr, i_am_host = found
+    console.print(f"[green]Adversário encontrado: {opp_id}! (Enter para entrar na partida)[/]")
+    await cancel_task  # se ainda não completou, aguarda o Enter do utilizador — resolve natural.
+
+    game_id = f"{min(player_id, opp_id)}-{max(player_id, opp_id)}"
+    if i_am_host:
+        client.publish("naval/matchmaking", json.dumps({
+            "command": "clear",
+            "host_id": player_id,
+            "host_addr": my_addr,
+        }))
+        await run_as_host(player_id, game_id, int(my_addr.split(":")[1]))
+    else:
+        await run_as_guest(player_id, game_id, opp_addr)
 
 def make_matchmaking_callback(my_id: str):
 
@@ -198,10 +233,12 @@ async def menu_1v1(client: mqtt.Client, player_id: str, my_addr: str):
                             console.print("[red]Inválido.[/]")
                 case "3":
                     await menu_matchmaking(client, player_id, my_addr)
+                    client.on_message = on_games_message  # restaurar callback após matchmaking
                 case "4":
                     break
-                case _:
-                    console.print("[red]Inválido.[/]")
+                case "" | _:
+                    if cmd:
+                        console.print("[red]Inválido.[/]")
     finally:
         client.unsubscribe("naval/games/#")
 
@@ -241,8 +278,9 @@ async def menu_torneio(client: mqtt.Client, player_id: str, my_addr: str):
                             console.print("[red]Inválido.[/]")
                 case "3":
                     break
-                case _:
-                    console.print("[red]Inválido.[/]")
+                case "" | _:
+                    if cmd:
+                        console.print("[red]Inválido.[/]")
     finally:
         client.unsubscribe("naval/tournament/#")
 
@@ -260,15 +298,17 @@ async def menu_principal(client: mqtt.Client, player_id: str, my_addr: str):
             case "3":
                 client.publish(f"naval/players/{player_id}", "offline", retain=True)
                 break
-            case _:
-                console.print("[red]Inválido.[/]")
+            case "" | _:
+                if cmd:
+                    console.print("[red]Inválido.[/]")
 
 
 async def main():
     show_title()
     player_id = (await aioconsole.ainput("Nome: ")).strip()
-    my_port = (await aioconsole.ainput("Porta (ex: 5000): ")).strip()
-    my_addr = f"localhost:{my_port}"
+    my_port   = find_free_port()
+    my_addr   = f"localhost:{my_port}"
+    console.print(f"[dim]Porta atribuída: {my_port}[/]")
 
     client = setup_mqtt(player_id)
     client.publish(f"naval/players/{player_id}", "online", retain=True)
