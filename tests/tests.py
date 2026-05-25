@@ -24,11 +24,11 @@ def test_sunk_returns_game_over_when_last_ship():
 
 # --- edge cases ---
 
-def test_shooting_same_cell_twice_still_counts_as_hit():
+def test_shooting_same_cell_twice_is_a_miss():
     b = Board(ships=[create_ship("Patrol Boat", (0, 0), horizontal=True)])
     b.register_shot(0, 0)
     result = b.register_shot(0, 0)
-    assert result == ("hit", "Patrol Boat", False)
+    assert result == ("miss", None, False)
 
 
 def test_sunk_with_other_ships_alive_is_not_game_over():
