@@ -1,3 +1,4 @@
 aioconsole
 paho-mqtt
 rich
+textual
