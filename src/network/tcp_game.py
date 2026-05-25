@@ -60,7 +60,7 @@ async def start_host_server(port: int):
     """Start listening on port and return (server, conn_future).
     The future resolves to (reader, writer) when a client connects.
     Call this before placement so the socket is open early."""
-    conn: asyncio.Future = asyncio.get_event_loop().create_future()
+    conn: asyncio.Future = asyncio.get_running_loop().create_future()
 
     async def on_connect(reader, writer):
         if not conn.done():
