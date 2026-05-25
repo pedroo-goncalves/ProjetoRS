@@ -164,7 +164,8 @@ class PlacementScreen(Screen):
             Cell(self.cursor_x, self.cursor_y),
             horizontal=self.horizontal,
         )
-        self.placed_board.ships.append(ship)
+        if not self.placed_board.place_ship(ship):
+            return
         self.ship_index += 1
         if self.ship_index >= len(SHIPS):
             self.dismiss(self.placed_board)  # return board to caller
