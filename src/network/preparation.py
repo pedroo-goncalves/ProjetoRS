@@ -1,6 +1,3 @@
-import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-
 from textual.app import App, ComposeResult
 from textual.screen import Screen
 from textual.widgets import Static, Footer, Header
