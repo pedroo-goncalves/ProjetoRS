@@ -88,6 +88,9 @@ async def run_as_host(player_id: str, game_id: str, port: int, my_board, ui: Gam
     msg = await recv_msg(reader)
 
     if msg["command"] != "ready":
+        ui.log("[red]Handshake inválido. A fechar ligação.[/]")
+        writer.close()
+        await writer.wait_closed()
         return
 
     await game_session(reader, writer, player_id, game_id, i_go_first=True, my_board=my_board, ui=ui)
@@ -108,6 +111,9 @@ async def run_as_guest(player_id: str, game_id: str, addr: str, my_board, ui: Ga
     msg = await recv_msg(reader)
 
     if msg["command"] != "ready":
+        ui.log("[red]Handshake inválido. A fechar ligação.[/]")
+        writer.close()
+        await writer.wait_closed()
         return
 
     await game_session(reader, writer, player_id, game_id, i_go_first=False, my_board=my_board, ui=ui)
