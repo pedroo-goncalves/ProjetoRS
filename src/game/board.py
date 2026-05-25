@@ -9,9 +9,12 @@ GRID_SIZE = 10
 class Board:
     ships: list[Ship]
 
-    def place_ship(self, ship:Ship) -> None:      
+    def place_ship(self, ship:Ship) -> bool:      
         if self.validate_placement(ship):
             self.ships.append(ship)
+            return True
+        
+        return False
 
 
     def register_shot(self, x:int,y:int) -> tuple[str, str | None, bool]:
