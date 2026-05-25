@@ -96,7 +96,11 @@ async def run_as_host(player_id: str, game_id: str, port: int, my_board, ui: Gam
 async def run_as_guest(player_id: str, game_id: str, addr: str, my_board, ui: GameUI) -> None:
     """Connect to host's TCP address, then play. Guest goes second."""
     host, port_str = addr.rsplit(":", 1)
-    reader, writer = await asyncio.open_connection(host, int(port_str))
+    try:
+        reader, writer = await asyncio.open_connection(host, int(port_str))
+    except (ConnectionRefusedError, OSError) as exc:
+        ui.log(f"[red]Falha ao ligar a {addr}: {exc}[/]")
+        return
     ui.log(f"[green]Ligado a {addr}[/]")
 
     await send_msg(writer, {"command": "ready"})
