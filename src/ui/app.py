@@ -700,3 +700,16 @@ class BatalhaNavalApp(App):
         self.client.connect(BROKER, PORT_MQTT)
         self.client.loop_start()
         self.client.publish(f"naval/players/{self.player_id}", "online", retain=True)
+
+    def _teardown_mqtt(self) -> None:
+        if not self.client:
+            return
+        try:
+            self.client.publish(f"naval/players/{self.player_id}", "offline", retain=True)
+            self.client.loop_stop()
+            self.client.disconnect()
+        finally:
+            self.client = None
+
+    def on_unmount(self) -> None:
+        self._teardown_mqtt()
