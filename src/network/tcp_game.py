@@ -82,6 +82,7 @@ async def run_as_host(player_id: str, game_id: str, port: int, my_board, ui: Gam
 
     reader, writer = await conn
     server.close()
+    await server.wait_closed()
 
     await send_msg(writer, {"command": "ready"})
     ui.log("[dim]À espera que o adversário esteja pronto…[/]")
