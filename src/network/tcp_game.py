@@ -85,16 +85,7 @@ async def run_as_host(player_id: str, game_id: str, port: int, my_board, ui: Gam
 
     reader, writer = await conn
     server.close()
-
-    await send_msg(writer, {"command": "ready"})
-    ui.log("[dim]À espera que o adversário esteja pronto…[/]")
-    msg = await recv_msg(reader)
-
-    if msg["command"] != "ready":
-        ui.log("[red]Handshake inválido. A fechar ligação.[/]")
-        writer.close()
-        await writer.wait_closed()
-        return
+    ui.log("[green]Adversário ligado! A iniciar partida…[/]")
 
     await game_session(reader, writer, player_id, game_id, i_go_first=True, my_board=my_board, ui=ui)
 
@@ -108,16 +99,6 @@ async def run_as_guest(player_id: str, game_id: str, addr: str, my_board, ui: Ga
         ui.log(f"[red]Falha ao ligar a {addr}: {exc}[/]")
         return
     ui.log(f"[green]Ligado a {addr}[/]")
-
-    await send_msg(writer, {"command": "ready"})
-    ui.log("[dim]À espera que o adversário esteja pronto…[/]")
-    msg = await recv_msg(reader)
-
-    if msg["command"] != "ready":
-        ui.log("[red]Handshake inválido. A fechar ligação.[/]")
-        writer.close()
-        await writer.wait_closed()
-        return
 
     await game_session(reader, writer, player_id, game_id, i_go_first=False, my_board=my_board, ui=ui)
 
@@ -149,7 +130,27 @@ async def game_session(
 async def _my_attack(writer, reader, game_id: str, ui: GameUI) -> bool:
     """My turn: ask for coordinates, send fire, wait for result."""
     while True:
-        raw = await ui.get_attack()
+        input_task   = asyncio.create_task(ui.get_attack())
+        network_task = asyncio.create_task(recv_msg(reader))
+
+        done, pending = await asyncio.wait(
+            [input_task, network_task], return_when=asyncio.FIRST_COMPLETED
+        )
+        for t in pending:
+            t.cancel()
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        if network_task in done:
+            # Opponent sent gameover while we were idle (forfeit)
+            msg = network_task.result()
+            if msg.get("command") == "gameover":
+                ui.log("[bold red]Tempo esgotado — derrota por abandono.[/]")
+            return True
+
+        raw = input_task.result()
 
         if raw.strip().lower() == "render":
             await send_msg(writer, {"command": "surrender", "game_id": game_id})

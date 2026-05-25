@@ -2,6 +2,7 @@ import json
 import uuid
 import socket
 import asyncio
+import sys
 
 import paho.mqtt.client as mqtt
 
@@ -20,7 +21,7 @@ from network.preparation import PlacementScreen
 from game.board import Board, GRID_SIZE
 from game.types import Cell
 
-BROKER    = "localhost"
+BROKER    = sys.argv[1] if len(sys.argv) > 1 else "localhost"
 PORT_MQTT = 1883
 
 TITLE_ART = """\
@@ -289,11 +290,13 @@ class Menu1v1Screen(Screen):
 
     @work
     async def _join(self, idx: int) -> None:
+        if idx >= len(self._game_items):
+            return
         game_id, game = self._game_items[idx]
         self.app.client.publish(f"naval/games/{game_id}", "closed", retain=True)
         self.app._game_topics.discard(f"naval/games/{game_id}")
         my_board = await self.app.push_screen_wait(PlacementScreen())
-        self.app.push_screen(GameScreen(
+        await self.app.push_screen_wait(GameScreen(
             player_id    = self.app.player_id,
             game_id      = game_id,
             my_board     = my_board,
@@ -304,22 +307,24 @@ class Menu1v1Screen(Screen):
     @work
     async def _criar(self) -> None:
         game_id     = str(uuid.uuid4())
-        port        = int(self.app.my_addr.split(":")[1])
-        server_info = await start_host_server(port)
+        server_info = await start_host_server(0)
+        server, _   = server_info
+        actual_port = server.sockets[0].getsockname()[1]
+        actual_addr = f"{get_local_ip()}:{actual_port}"
         topic = f"naval/games/{game_id}"
         self.app.client.publish(
             topic,
-            json.dumps({"host": self.app.player_id, "addr": self.app.my_addr}),
+            json.dumps({"host": self.app.player_id, "addr": actual_addr}),
             retain=True,
         )
         self.app._game_topics.add(topic)
         my_board = await self.app.push_screen_wait(PlacementScreen())
-        self.app.push_screen(GameScreen(
+        await self.app.push_screen_wait(GameScreen(
             player_id    = self.app.player_id,
             game_id      = game_id,
             my_board     = my_board,
             is_host      = True,
-            addr_or_port = port,
+            addr_or_port = actual_port,
             server_info  = server_info,
         ))
 
@@ -343,9 +348,9 @@ class MatchmakingScreen(Screen):
         yield Static("", id="mm_status")
 
     def on_mount(self) -> None:
-        self._queue:     dict       = {}
+        self._queue:     dict         = {}
         self._found:     tuple | None = None
-        self._cancelled: bool       = False
+        self._cancelled: bool         = False
         self._search()
 
     def on_unmount(self) -> None:
@@ -419,7 +424,7 @@ class MatchmakingScreen(Screen):
             port        = int(my_addr.split(":")[1])
             server_info = await start_host_server(port)
             my_board    = await self.app.push_screen_wait(PlacementScreen())
-            self.app.push_screen(GameScreen(
+            await self.app.push_screen_wait(GameScreen(
                 player_id    = player_id,
                 game_id      = game_id,
                 my_board     = my_board,
@@ -427,15 +432,17 @@ class MatchmakingScreen(Screen):
                 addr_or_port = port,
                 server_info  = server_info,
             ))
+            self.app.pop_screen()
         else:
             my_board = await self.app.push_screen_wait(PlacementScreen())
-            self.app.push_screen(GameScreen(
+            await self.app.push_screen_wait(GameScreen(
                 player_id    = player_id,
                 game_id      = game_id,
                 my_board     = my_board,
                 is_host      = False,
                 addr_or_port = opp_addr,
             ))
+            self.app.pop_screen()
 
     def action_cancel(self) -> None:
         self._cancelled = True
@@ -611,19 +618,21 @@ class GameScreen(Screen):
         self.server_info  = server_info
         self.game_ui      = GameUI()
         self.tracking:    dict[tuple, str] = {}
+        self._game_ended  = False
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
         with ContentSwitcher(initial="waiting"):
             with Vertical(id="attack"):
                 yield Static("", id="tracking_board")
-                yield Input(
-                    placeholder="Coordenada (ex: A5)  ou  render (rende)",
-                    id="attack_input",
-                )
             with Vertical(id="waiting"):
                 yield Static("", id="my_board_display")
                 yield Static("[dim]À espera de ligação e adversário…[/]", id="wait_status")
+        yield Input(
+            placeholder="Coordenada (ex: A5)  ou  render (rende)",
+            id="attack_input",
+            disabled=True,
+        )
         yield RichLog(id="log", markup=True, highlight=False)
         yield Footer()
 
@@ -652,6 +661,10 @@ class GameScreen(Screen):
 
     def _set_turn(self, my_turn: bool) -> None:
         self.query_one(ContentSwitcher).current = "attack" if my_turn else "waiting"
+        inp = self.query_one("#attack_input", Input)
+        inp.disabled = not my_turn
+        if my_turn:
+            inp.focus()
         self._render_boards()
 
     def _render_boards(self) -> None:
@@ -665,18 +678,32 @@ class GameScreen(Screen):
             self.game_ui.submit_attack(coord)
             self.query_one("#attack_input", Input).value = ""
 
+    def on_key(self, event) -> None:
+        if self._game_ended and event.key == "enter":
+            event.stop()
+            self.dismiss()
+
+    def _end_game(self) -> None:
+        self._game_ended = True
+        self.query_one("#attack_input", Input).disabled = True
+        self.query_one("#log", RichLog).write(
+            "[dim]Prima Enter para voltar ao menu principal.[/]"
+        )
+
     @work(exclusive=True)
     async def _run_host(self) -> None:
         await run_as_host(
             self.player_id, self.game_id, self.addr_or_port, self.my_board, self.game_ui,
             server_info=self.server_info,
         )
+        self._end_game()
 
     @work(exclusive=True)
     async def _run_guest(self) -> None:
         await run_as_guest(
             self.player_id, self.game_id, self.addr_or_port, self.my_board, self.game_ui
         )
+        self._end_game()
 
 
 # ── App ───────────────────────────────────────────────────────────
@@ -714,9 +741,6 @@ class BatalhaNavalApp(App):
             self.client = None
 
     def on_unmount(self) -> None:
-        self._teardown_mqtt()
-
-    def on_exit(self) -> None:
         self._teardown_mqtt()
 
     def on_exit(self) -> None:
