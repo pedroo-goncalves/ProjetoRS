@@ -713,3 +713,6 @@ class BatalhaNavalApp(App):
 
     def on_unmount(self) -> None:
         self._teardown_mqtt()
+
+    def on_exit(self) -> None:
+        self._teardown_mqtt()
