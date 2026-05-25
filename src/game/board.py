@@ -6,7 +6,7 @@ from dataclasses import dataclass
 GRID_SIZE = 10
 
 @dataclass
-class board:
+class Board:
     ships: list[Ship]
 
     def place_ship(self, ship:Ship) -> None:      
