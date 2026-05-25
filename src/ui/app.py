@@ -40,6 +40,16 @@ def find_free_port() -> int:
         return s.getsockname()[1]
 
 
+def get_local_ip() -> str:
+    """Return the machine's LAN IP by probing a UDP route (no packet sent)."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        try:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+        except OSError:
+            return "127.0.0.1"
+
+
 # ── Board rendering ───────────────────────────────────────────────
 
 _EMPTY = "[dim]·[/]"
@@ -105,7 +115,7 @@ class SetupScreen(Screen):
         name = self.query_one("#name_input", Input).value.strip()
         if name:
             self.app.player_id = name
-            self.app.my_addr   = f"localhost:{find_free_port()}"
+            self.app.my_addr   = f"{get_local_ip()}:{find_free_port()}"
             self.app.setup_mqtt()
             self.app.push_screen(MainMenuScreen())
 
@@ -192,13 +202,12 @@ class Menu1v1Screen(Screen):
 
     def on_mount(self) -> None:
         self._game_items: list[tuple[str, dict]] = []
+        self.app.client.message_callback_add("naval/games/#", self._on_mqtt_message)
         self.app.client.subscribe("naval/games/#")
         self._refresh()
 
-    def on_show(self) -> None:
-        self.app.client.on_message = self._on_mqtt_message
-
     def on_unmount(self) -> None:
+        self.app.client.message_callback_remove("naval/games/#")
         self.app.client.unsubscribe("naval/games/#")
 
     def _on_mqtt_message(self, client, userdata, msg) -> None:
@@ -282,6 +291,7 @@ class Menu1v1Screen(Screen):
     async def _join(self, idx: int) -> None:
         game_id, game = self._game_items[idx]
         self.app.client.publish(f"naval/games/{game_id}", "closed", retain=True)
+        self.app._game_topics.discard(f"naval/games/{game_id}")
         my_board = await self.app.push_screen_wait(PlacementScreen())
         self.app.push_screen(GameScreen(
             player_id    = self.app.player_id,
@@ -296,11 +306,13 @@ class Menu1v1Screen(Screen):
         game_id     = str(uuid.uuid4())
         port        = int(self.app.my_addr.split(":")[1])
         server_info = await start_host_server(port)
+        topic = f"naval/games/{game_id}"
         self.app.client.publish(
-            f"naval/games/{game_id}",
+            topic,
             json.dumps({"host": self.app.player_id, "addr": self.app.my_addr}),
             retain=True,
         )
+        self.app._game_topics.add(topic)
         my_board = await self.app.push_screen_wait(PlacementScreen())
         self.app.push_screen(GameScreen(
             player_id    = self.app.player_id,
@@ -322,8 +334,7 @@ class MatchmakingScreen(Screen):
     """
 
     BINDINGS = [
-        ("escape", "cancel",  "Cancelar"),
-        ("enter",  "confirm", "Confirmar"),
+        ("escape", "cancel", "Cancelar"),
     ]
 
     status: reactive[str] = reactive("")
@@ -338,37 +349,32 @@ class MatchmakingScreen(Screen):
         self._search()
 
     def on_unmount(self) -> None:
-        self.app.client.unsubscribe("naval/matchmaking")
+        self.app.client.message_callback_remove("naval/matchmaking/+")
+        self.app.client.unsubscribe("naval/matchmaking/+")
 
     def watch_status(self, val: str) -> None:
         self.query_one("#mm_status", Static).update(val)
 
-    def _handle_matchmaking_message(self, data: dict) -> None:
+    def _handle_matchmaking_message(self, sender_id: str, data: dict | None) -> None:
         player_id = self.app.player_id
-
-        if data.get("command") == "clear":
-            host_id   = data.get("host_id")
-            host_addr = data.get("host_addr")
-            if host_id != player_id and player_id < host_id:
-                self._queue["__host__"] = (host_id, host_addr)
-            else:
-                self._queue.clear()
+        if sender_id == player_id:
             return
-
-        if data.get("command") == "cancel":
-            self._queue.pop(data.get("player_id"), None)
-            return
-
-        if data.get("player_id") != player_id:
-            self._queue[data["player_id"]] = data["addr"]
+        # Ignore clears: if we already have an addr for this player, keep it.
+        # They cleared because they found a match; their TCP server is still up.
+        if data is not None:
+            self._queue[sender_id] = data["addr"]
 
     def _on_mqtt_message(self, client, userdata, msg) -> None:
-        payload = msg.payload.decode()
+        sender_id = msg.topic.split("/")[-1]
+        payload   = msg.payload.decode()
+        if not payload:
+            self.app.call_from_thread(self._handle_matchmaking_message, sender_id, None)
+            return
         try:
             data = json.loads(payload)
         except json.JSONDecodeError:
             return
-        self.app.call_from_thread(self._handle_matchmaking_message, data)
+        self.app.call_from_thread(self._handle_matchmaking_message, sender_id, data)
 
     @work
     async def _search(self) -> None:
@@ -382,54 +388,35 @@ class MatchmakingScreen(Screen):
         player_id = self.app.player_id
         my_addr   = self.app.my_addr
 
-        self.app.client.subscribe("naval/matchmaking")
-        self.app.client.on_message = self._on_mqtt_message
+        self.app.client.message_callback_add("naval/matchmaking/+", self._on_mqtt_message)
+        self.app.client.subscribe("naval/matchmaking/+")
         self.app.client.publish(
-            "naval/matchmaking",
+            f"naval/matchmaking/{player_id}",
             json.dumps({"player_id": player_id, "addr": my_addr}),
+            retain=True,
         )
         self.status = "[dim]À procura de adversário… (Esc para cancelar)[/]"
 
         while not self._cancelled:
             await asyncio.sleep(0.25)
-            if "__host__" in self._queue:
-                opp_id, opp_addr = self._queue.pop("__host__")
-                self._found = (opp_id, opp_addr, False)
-                break
-            elif self._queue:
+            if self._queue:
                 opp_id, opp_addr = next(iter(self._queue.items()))
-                self._queue.clear()
                 self._found = (opp_id, opp_addr, player_id > opp_id)
                 break
 
-        if self._found and not self._cancelled:
-            opp_id = self._found[0]
-            self.status = f"[green]Adversário encontrado: {opp_id}!\n(Enter para entrar)[/]"
-
-    def action_cancel(self) -> None:
-        self._cancelled = True
-        self.app.client.publish("naval/matchmaking", json.dumps({
-            "command":   "cancel",
-            "player_id": self.app.player_id,
-        }))
-        self.app.pop_screen()
-
-    @work
-    async def action_confirm(self) -> None:
-        if self._found is None:
+        if not self._found or self._cancelled:
             return
+
         self._cancelled = True
         opp_id, opp_addr, i_am_host = self._found
-        player_id = self.app.player_id
-        game_id   = f"{min(player_id, opp_id)}-{max(player_id, opp_id)}"
+        game_id = f"{min(player_id, opp_id)}-{max(player_id, opp_id)}"
+        self.status = f"[green]Adversário encontrado: {opp_id}! A iniciar…[/]"
+
+        # Clear our retained presence so no other player tries to match with us
+        self.app.client.publish(f"naval/matchmaking/{player_id}", b"", retain=True)
 
         if i_am_host:
-            self.app.client.publish("naval/matchmaking", json.dumps({
-                "command":   "clear",
-                "host_id":   player_id,
-                "host_addr": self.app.my_addr,
-            }))
-            port        = int(self.app.my_addr.split(":")[1])
+            port        = int(my_addr.split(":")[1])
             server_info = await start_host_server(port)
             my_board    = await self.app.push_screen_wait(PlacementScreen())
             self.app.push_screen(GameScreen(
@@ -449,6 +436,13 @@ class MatchmakingScreen(Screen):
                 is_host      = False,
                 addr_or_port = opp_addr,
             ))
+
+    def action_cancel(self) -> None:
+        self._cancelled = True
+        self.app.client.publish(
+            f"naval/matchmaking/{self.app.player_id}", b"", retain=True
+        )
+        self.app.pop_screen()
 
 
 # ── MenuTorneioScreen ─────────────────────────────────────────────
@@ -481,12 +475,13 @@ class MenuTorneioScreen(Screen):
 
     def on_mount(self) -> None:
         self._tourney_items: list[tuple[str, dict]] = []
+        self.app.client.message_callback_add("naval/tournament/#", self._on_mqtt_message)
         self.app.client.subscribe("naval/tournament/#")
-        self.app.client.on_message = self._on_mqtt_message
         self.query_one("#max_input", Input).display = False
         self._refresh()
 
     def on_unmount(self) -> None:
+        self.app.client.message_callback_remove("naval/tournament/#")
         self.app.client.unsubscribe("naval/tournament/#")
 
     def _on_mqtt_message(self, client, userdata, msg) -> None:
@@ -688,9 +683,10 @@ class GameScreen(Screen):
 
 class BatalhaNavalApp(App):
 
-    player_id: str         = ""
-    my_addr:   str         = ""
-    client:    mqtt.Client = None
+    player_id:    str         = ""
+    my_addr:      str         = ""
+    client:       mqtt.Client = None
+    _game_topics: set         = set()  # retained topics we published; cleared on exit
 
     def on_mount(self) -> None:
         self.push_screen(SetupScreen())
@@ -700,18 +696,27 @@ class BatalhaNavalApp(App):
         self.client.connect(BROKER, PORT_MQTT)
         self.client.loop_start()
         self.client.publish(f"naval/players/{self.player_id}", "online", retain=True)
+        # Clear any stale matchmaking entry left by a previous crash of this player
+        self.client.publish(f"naval/matchmaking/{self.player_id}", b"", retain=True)
 
     def _teardown_mqtt(self) -> None:
         if not self.client:
             return
         try:
             self.client.publish(f"naval/players/{self.player_id}", "offline", retain=True)
+            # Remove retained game topics so stale listings don't appear after a crash
+            for topic in self._game_topics:
+                self.client.publish(topic, b"", retain=True)
+            self._game_topics.clear()
             self.client.loop_stop()
             self.client.disconnect()
         finally:
             self.client = None
 
     def on_unmount(self) -> None:
+        self._teardown_mqtt()
+
+    def on_exit(self) -> None:
         self._teardown_mqtt()
 
     def on_exit(self) -> None:

@@ -65,6 +65,9 @@ async def start_host_server(port: int):
     async def on_connect(reader, writer):
         if not conn.done():
             conn.set_result((reader, writer))
+        else:
+            writer.close()
+            await writer.wait_closed()
 
     server = await asyncio.start_server(on_connect, "0.0.0.0", port)
     return server, conn
@@ -82,7 +85,6 @@ async def run_as_host(player_id: str, game_id: str, port: int, my_board, ui: Gam
 
     reader, writer = await conn
     server.close()
-    await server.wait_closed()
 
     await send_msg(writer, {"command": "ready"})
     ui.log("[dim]À espera que o adversário esteja pronto…[/]")
@@ -162,7 +164,11 @@ async def _my_attack(writer, reader, game_id: str, ui: GameUI) -> bool:
 
     await send_msg(writer, {"command": "fire", "game_id": game_id, "x": col, "y": row})
 
-    msg = await asyncio.wait_for(recv_msg(reader), timeout=TIMEOUT)
+    try:
+        msg = await asyncio.wait_for(recv_msg(reader), timeout=TIMEOUT)
+    except asyncio.TimeoutError:
+        ui.log("[red]Tempo esgotado a aguardar resultado.[/]")
+        return True
 
     if msg["command"] == "gameover":
         ui.log("[bold green]Vitória! Todos os navios afundados.[/]")
