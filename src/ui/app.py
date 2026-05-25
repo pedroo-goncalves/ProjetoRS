@@ -343,14 +343,7 @@ class MatchmakingScreen(Screen):
     def watch_status(self, val: str) -> None:
         self.query_one("#mm_status", Static).update(val)
 
-    # Called from paho's thread — only modifies self._queue (GIL-safe dict ops)
-    def _on_mqtt_message(self, client, userdata, msg) -> None:
-        payload = msg.payload.decode()
-        try:
-            data = json.loads(payload)
-        except json.JSONDecodeError:
-            return
-
+    def _handle_matchmaking_message(self, data: dict) -> None:
         player_id = self.app.player_id
 
         if data.get("command") == "clear":
@@ -368,6 +361,14 @@ class MatchmakingScreen(Screen):
 
         if data.get("player_id") != player_id:
             self._queue[data["player_id"]] = data["addr"]
+
+    def _on_mqtt_message(self, client, userdata, msg) -> None:
+        payload = msg.payload.decode()
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            return
+        self.app.call_from_thread(self._handle_matchmaking_message, data)
 
     @work
     async def _search(self) -> None:
