@@ -53,24 +53,27 @@ def get_local_ip() -> str:
 
 # ── Board rendering ───────────────────────────────────────────────
 
-_EMPTY = "[dim]·[/]"
-_MISS  = "[blue]○[/]"
-_HIT   = "[yellow]×[/]"
-_SUNK  = "[red]■[/]"
-_SHIP  = "[green]█[/]"
+_EMPTY  = "[dim]·[/]"
+_MISS   = "[blue]○[/]"
+_HIT    = "[yellow]×[/]"
+_SUNK   = "[red]■[/]"
+_SHIP   = "[green]█[/]"
+_CURSOR = "[bold reverse]·[/]"
 
 
-def _render_tracking(tracking: dict) -> str:
+def _render_tracking(tracking: dict[Cell, str], cursor: tuple[int, int] | None = None) -> str:
     header = "     " + "   ".join("ABCDEFGHIJ")
     rows = [header]
     for y in range(GRID_SIZE):
         cells = []
         for x in range(GRID_SIZE):
-            o = tracking.get((x, y))
-            if   o == "miss": cells.append(_MISS)
-            elif o == "hit":  cells.append(_HIT)
-            elif o == "sunk": cells.append(_SUNK)
-            else:             cells.append(_EMPTY)
+            outcome = tracking.get((x, y))
+            if cursor == (x, y):
+                cells.append(_CURSOR)
+            elif outcome == "miss": cells.append(_MISS)
+            elif outcome == "hit":  cells.append(_HIT)
+            elif outcome == "sunk": cells.append(_SUNK)
+            else:                   cells.append(_EMPTY)
         rows.append(f"{y + 1:>2}   " + "   ".join(cells))
     return "\n\n".join(rows)
 
@@ -78,9 +81,13 @@ def _render_tracking(tracking: dict) -> str:
 def _render_my_board(my_board: Board) -> str:
     ship_cells: set[Cell] = set()
     hit_cells:  set[Cell] = set()
+    sunk_cells: set[Cell] = set()
     for ship in my_board.ships:
         ship_cells |= ship.position
-        hit_cells  |= ship.hits
+        if ship.is_sunk():
+            sunk_cells |= ship.position
+        else:
+            hit_cells |= ship.hits
 
     header = "     " + "   ".join("ABCDEFGHIJ")
     rows = [header]
@@ -88,7 +95,8 @@ def _render_my_board(my_board: Board) -> str:
         cells = []
         for x in range(GRID_SIZE):
             cell = Cell(x, y)
-            if   cell in hit_cells:  cells.append(_HIT)
+            if   cell in sunk_cells: cells.append(_SUNK)
+            elif cell in hit_cells:  cells.append(_HIT)
             elif cell in ship_cells: cells.append(_SHIP)
             else:                    cells.append(_EMPTY)
         rows.append(f"{y + 1:>2}   " + "   ".join(cells))
@@ -597,8 +605,17 @@ class GameScreen(Screen):
     ContentSwitcher { height: 1fr; }
     #attack, #waiting { padding: 1 2; }
     #log            { height: 10; border: solid $primary; }
-    #attack_input   { width: 40; margin-top: 1; }
+    #cursor_label   { margin-top: 1; }
     """
+
+    BINDINGS = [
+        ("up",    "cursor_up",    ""),
+        ("down",  "cursor_down",  ""),
+        ("left",  "cursor_left",  ""),
+        ("right", "cursor_right", ""),
+        ("enter", "fire",         "Atacar"),
+        ("r",     "surrender",    "Render"),
+    ]
 
     def __init__(
         self,
@@ -617,27 +634,26 @@ class GameScreen(Screen):
         self.addr_or_port = addr_or_port
         self.server_info  = server_info
         self.game_ui      = GameUI()
-        self.tracking:    dict[tuple, str] = {}
+        self.tracking:    dict[Cell, str] = {}
         self._game_ended  = False
+        self._my_turn     = False
+        self._cursor      = [0, 0]
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
         with ContentSwitcher(initial="waiting"):
             with Vertical(id="attack"):
                 yield Static("", id="tracking_board")
+                yield Static("", id="cursor_label")
             with Vertical(id="waiting"):
                 yield Static("", id="my_board_display")
                 yield Static("[dim]À espera de ligação e adversário…[/]", id="wait_status")
-        yield Input(
-            placeholder="Coordenada (ex: A5)  ou  render (rende)",
-            id="attack_input",
-            disabled=True,
-        )
         yield RichLog(id="log", markup=True, highlight=False)
         yield Footer()
 
     def on_mount(self) -> None:
         self.title = f"Batalha Naval — {self.player_id}"
+        self.query_one("#log", RichLog).can_focus = False
         self._wire_ui()
         self._render_boards()
         if self.is_host:
@@ -660,32 +676,46 @@ class GameScreen(Screen):
         self._render_boards()
 
     def _set_turn(self, my_turn: bool) -> None:
+        self._my_turn = my_turn
         self.query_one(ContentSwitcher).current = "attack" if my_turn else "waiting"
-        inp = self.query_one("#attack_input", Input)
-        inp.disabled = not my_turn
-        if my_turn:
-            inp.focus()
         self._render_boards()
 
     def _render_boards(self) -> None:
-        self.query_one("#tracking_board",   Static).update(_render_tracking(self.tracking))
+        x, y = self._cursor
+        cursor = (x, y) if self._my_turn else None
+        self.query_one("#tracking_board",   Static).update(_render_tracking(self.tracking, cursor))
         self.query_one("#my_board_display", Static).update(_render_my_board(self.my_board))
+        coord = f"{chr(ord('A') + x)}{y + 1}"
+        label = f"Alvo: [bold cyan]{coord}[/]  [dim](↑↓←→ mover  Enter atacar  R render)[/]" if self._my_turn else ""
+        self.query_one("#cursor_label", Static).update(label)
 
-    @on(Input.Submitted, "#attack_input")
-    def on_attack(self, event: Input.Submitted) -> None:
-        coord = event.value.strip()
-        if coord:
-            self.game_ui.submit_attack(coord)
-            self.query_one("#attack_input", Input).value = ""
+    def action_cursor_up(self)    -> None:
+        if self._my_turn: self._cursor[1] = max(0, self._cursor[1] - 1); self._render_boards()
 
-    def on_key(self, event) -> None:
-        if self._game_ended and event.key == "enter":
-            event.stop()
+    def action_cursor_down(self)  -> None:
+        if self._my_turn: self._cursor[1] = min(GRID_SIZE - 1, self._cursor[1] + 1); self._render_boards()
+
+    def action_cursor_left(self)  -> None:
+        if self._my_turn: self._cursor[0] = max(0, self._cursor[0] - 1); self._render_boards()
+
+    def action_cursor_right(self) -> None:
+        if self._my_turn: self._cursor[0] = min(GRID_SIZE - 1, self._cursor[0] + 1); self._render_boards()
+
+    def action_fire(self) -> None:
+        if self._game_ended:
             self.dismiss()
+            return
+        if self._my_turn:
+            x, y = self._cursor
+            self.game_ui.submit_attack(f"{chr(ord('A') + x)}{y + 1}")
+
+    def action_surrender(self) -> None:
+        if self._my_turn:
+            self.game_ui.submit_attack("render")
 
     def _end_game(self) -> None:
         self._game_ended = True
-        self.query_one("#attack_input", Input).disabled = True
+        self._my_turn    = False
         self.query_one("#log", RichLog).write(
             "[dim]Prima Enter para voltar ao menu principal.[/]"
         )
