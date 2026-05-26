@@ -1,5 +1,6 @@
 import asyncio
 from network.protocol import send_msg, recv_msg
+from game.types import Cell
 
 TIMEOUT = 60  # seconds before forfeit
 
@@ -110,11 +111,16 @@ async def game_session(
 ) -> None:
     """Run the full game turn by turn until someone wins or disconnects."""
     my_turn = i_go_first
+
+    # Keep track of attacked cells
+    # This allows to prevent user to shoot the same cell twice
+    my_attacks: set[Cell] = set()
+
     try:
         while True:
             ui.set_turn(my_turn)
             if my_turn:
-                ended = await _my_attack(writer, reader, game_id, ui)
+                ended = await _my_attack(writer, reader, game_id, ui, my_attacks)
             else:
                 ended = await _their_attack(reader, writer, player_id, game_id, my_board, ui)
             if ended:
@@ -127,7 +133,7 @@ async def game_session(
         await writer.wait_closed()
 
 
-async def _my_attack(writer, reader, game_id: str, ui: GameUI) -> bool:
+async def _my_attack(writer, reader, game_id: str, ui: GameUI, attacks: set[Cell]) -> bool:
     """My turn: ask for coordinates, send fire, wait for result."""
     while True:
         input_task   = asyncio.create_task(ui.get_attack())
@@ -159,10 +165,19 @@ async def _my_attack(writer, reader, game_id: str, ui: GameUI) -> bool:
 
         try:
             col, row = _parse_coord(raw)
-            break
+            cell = Cell(col, row)
         except (ValueError, IndexError):
             ui.log("[red]Formato inválido. Exemplo: A5  (letra A-J + número 1-10)[/]")
+            continue
 
+        if cell in attacks:
+            ui.log("[red]Coordenada já atacada.[/]")
+            continue
+
+        break
+
+
+    attacks.add(cell)  
     await send_msg(writer, {"command": "fire", "game_id": game_id, "x": col, "y": row})
 
     try:
@@ -176,17 +191,26 @@ async def _my_attack(writer, reader, game_id: str, ui: GameUI) -> bool:
         return True
 
     outcome = msg.get("outcome", "miss")
-    ship    = msg.get("ship")
-    coord   = _coord_str(col, row)
+
+    ship_name = msg.get("ship")
+    if outcome == "sunk":
+        ship_positions = msg.get("ship_cells")
+
+    coord = _coord_str(col, row)
 
     if outcome == "miss":
         ui.log(f"{coord} → Água.")
     elif outcome == "hit":
         ui.log(f"[yellow]{coord} → Acertou![/]")
     elif outcome == "sunk":
-        ui.log(f"[red]{coord} → Afundou o {ship or '?'}![/]")
+        ui.log(f"[red]{coord} → Afundou o {ship_name or '?'}![/]")
 
-    ui.update_tracking(col, row, outcome, ship)
+        for p in ship_positions:
+            ui.update_tracking(p[0], p[1], outcome, ship_name)
+
+        return False
+    
+    ui.update_tracking(col, row, outcome, ship_name)
     return False
 
 
@@ -207,9 +231,17 @@ async def _their_attack(reader, writer, player_id: str, game_id: str, my_board, 
         return False
 
     x, y = msg["x"], msg["y"]
+
+    # Ship will be the object, if outcome is sunk
     outcome, ship, game_over = my_board.register_shot(x, y)
 
-    ui.update_my_board(x, y, outcome)
+    if outcome == "sunk":
+        # Update all ship positions to sunk
+        for p in ship.position:
+            ui.update_my_board(p.x, p.y, outcome)
+    else:
+        ui.update_my_board(x, y, outcome)
+
     ui.log(f"[dim]{_coord_str(x, y)} → adversário: {outcome}.[/]")
 
     if game_over:
@@ -218,8 +250,14 @@ async def _their_attack(reader, writer, player_id: str, game_id: str, my_board, 
         return True
 
     result = {"command": "result", "game_id": game_id, "outcome": outcome}
+
     if ship:
-        result["ship"] = ship
+        if outcome == "sunk":
+            result["ship"] = ship.name
+            result["ship_cells"] = [cell for cell in ship.position]
+        else:
+            result["ship"] = ship
+
     await send_msg(writer, result)
 
     return False

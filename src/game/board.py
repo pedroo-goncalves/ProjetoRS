@@ -17,20 +17,13 @@ class Board:
         return False
 
 
-    def register_shot(self, x:int,y:int) -> tuple[str, str | None, bool]:
+    def register_shot(self, x:int,y:int) -> tuple[str, Ship | str | None, bool]:
         shot = Cell(x,y)
 
         for ship in self.ships:
-            # Check if ship was already sunken or shot in that place
-            was_sunk    = ship.is_sunk()
-            already_hit = shot in ship.hits  # snapshot before register_hit mutates ship.hits
-
-            if ship.register_hit(shot):
-                if was_sunk or already_hit:
-                    return ("miss", None, False)
-
+            if ship.register_hit(shot):  
                 if ship.is_sunk():
-                    return ("sunk", ship.name, self.is_game_over())
+                    return ("sunk", ship, self.is_game_over())
 
                 return ("hit", ship.name, False)
 
