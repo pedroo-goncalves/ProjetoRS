@@ -1,5 +1,7 @@
 import json
+import re
 import uuid
+from typing import Optional
 import socket
 import asyncio
 import sys
@@ -97,6 +99,9 @@ def _render_my_board(my_board: Board) -> str:
 
 # ── SetupScreen ───────────────────────────────────────────────────
 
+_NAME_RE = re.compile(r'^[A-Za-z0-9]+$')
+
+
 class SetupScreen(Screen):
 
     CSS = """
@@ -104,21 +109,30 @@ class SetupScreen(Screen):
     #title { margin-bottom: 1; }
     .lbl   { color: cyan; margin-top: 1; margin-bottom: 0; }
     Input  { width: 36; border: tall $panel; padding: 0 1; margin-bottom: 0; }
+    #name_error { color: red; height: 1; margin-top: 0; }
     """
 
     def compose(self) -> ComposeResult:
         yield Static(TITLE_ART, id="title")
         yield Static("Nome de jogador", classes="lbl")
         yield Input(id="name_input")
+        yield Static("", id="name_error")
 
     @on(Input.Submitted, "#name_input")
     def on_enter(self) -> None:
-        name = self.query_one("#name_input", Input).value.strip()
-        if name:
-            self.app.player_id = name
-            self.app.my_addr   = f"{get_local_ip()}:{find_free_port()}"
-            self.app.setup_mqtt()
-            self.app.push_screen(MainMenuScreen())
+        name  = self.query_one("#name_input", Input).value.strip()
+        error = self.query_one("#name_error", Static)
+        if not name:
+            error.update("O nome não pode estar vazio.")
+            return
+        if not _NAME_RE.match(name):
+            error.update("Só são permitidas letras (a-z) e números (0-9).")
+            return
+        error.update("")
+        self.app.player_id = name
+        self.app.my_addr   = f"{get_local_ip()}:{find_free_port()}"
+        self.app.setup_mqtt()
+        self.app.push_screen(MainMenuScreen())
 
 
 # ── MainMenuScreen ────────────────────────────────────────────────
@@ -254,7 +268,7 @@ class Menu1v1Screen(Screen):
         else:
             for i, (_, game) in enumerate(self._game_items):
                 prefix = "[yellow]►[/] " if (in_games and i == self.games_cursor) else "  "
-                lines.append(f"{prefix}[cyan]{game['host']}[/]")
+                lines.append(f"{prefix}[cyan]{game.get('host', '?')}[/]")
 
         self.query_one("#display", Static).update("\n".join(lines))
 
@@ -381,7 +395,7 @@ class MatchmakingScreen(Screen):
             return
         self.app.call_from_thread(self._handle_matchmaking_message, sender_id, data)
 
-    @work
+    @work(exit_on_error=False)
     async def _search(self) -> None:
         for n in range(3, 0, -1):
             self.status = f"[dim]A entrar na fila em {n}…[/]"
@@ -421,9 +435,13 @@ class MatchmakingScreen(Screen):
         self.app.client.publish(f"naval/matchmaking/{player_id}", b"", retain=True)
 
         if i_am_host:
-            port        = int(my_addr.split(":")[1])
-            server_info = await start_host_server(port)
-            my_board    = await self.app.push_screen_wait(PlacementScreen())
+            port = int(my_addr.split(":")[1])
+            try:
+                server_info = await start_host_server(port)
+            except OSError:
+                self.status = "[red]Porta ocupada. Tenta novamente.[/]"
+                return
+            my_board = await self.app.push_screen_wait(PlacementScreen())
             await self.app.push_screen_wait(GameScreen(
                 player_id    = player_id,
                 game_id      = game_id,
@@ -476,25 +494,257 @@ class MenuTorneioScreen(Screen):
     mode:                  reactive[str]  = reactive("menu")
     available_tournaments: reactive[dict] = reactive({})
 
+    def __init__(self) -> None:
+        super().__init__()
+        # lobby state
+        self.players: dict = {}
+        self.max_players: int = 0
+        self.current_tournament_id: str | None = None
+        self._tourney_items: list = []
+        self._my_lobby_topic: str | None = None
+        self._tournament_started: bool = False
+        self._i_am_host: bool = False
+        self._host_id: str = ""
+        # tournament round state
+        self.active_players: list = []
+        self.round: int = 1
+        self.max_rounds: int = 0
+        self.round_winners: dict = {}
+        self._round_event: asyncio.Event | None = None
+        self._bracket_history: list[dict] = []
+
+    
     def compose(self) -> ComposeResult:
         yield Static("", id="display")
-        yield Input(placeholder="Jogadores: 4 ou 8", id="max_input")
 
     def on_mount(self) -> None:
-        self._tourney_items: list[tuple[str, dict]] = []
         self.app.client.message_callback_add("naval/tournament/#", self._on_mqtt_message)
         self.app.client.subscribe("naval/tournament/#")
-        self.query_one("#max_input", Input).display = False
         self._refresh()
 
     def on_unmount(self) -> None:
         self.app.client.message_callback_remove("naval/tournament/#")
         self.app.client.unsubscribe("naval/tournament/#")
+        tid = self.current_tournament_id
+        if tid:
+            # Clear lobby presence
+            lobby_filter = f"naval/tournament/LOBBY/{tid}/+"
+            self.app.client.message_callback_remove(lobby_filter)
+            self.app.client.unsubscribe(lobby_filter)
+            if self._my_lobby_topic:
+                self.app.client.publish(self._my_lobby_topic, b"", retain=True)
+            # Clear winner topics for every round
+            for r in range(1, (self.max_rounds or 3) + 1):
+                wf = f"naval/tournament/{tid}/winner/round{r}/+"
+                self.app.client.message_callback_remove(wf)
+                self.app.client.unsubscribe(wf)
+                self.app.client.publish(
+                    f"naval/tournament/{tid}/winner/round{r}/{self.app.player_id}",
+                    b"", retain=True,
+                )
+            # Clear current match game address (if we were host of this match)
+            if self.active_players and self.app.player_id in self.active_players:
+                my_idx = self.active_players.index(self.app.player_id)
+                opp_idx = my_idx + 1 if my_idx % 2 == 0 else my_idx - 1
+                if 0 <= opp_idx < len(self.active_players):
+                    opp_id  = self.active_players[opp_idx]
+                    game_id = f"{min(self.app.player_id, opp_id)}-{max(self.app.player_id, opp_id)}"
+                    self.app.client.publish(
+                        f"naval/tournament/{tid}/game/{game_id}", b"", retain=True
+                    )
+            # If we created the tournament, remove its announcement
+            if self._i_am_host:
+                self.app.client.publish(f"naval/tournament/{tid}", b"", retain=True)
+
+    # --- Lógica de Lobby Descentralizado ---
+
+    def join_tournament(self, tournament_id: str, max_p: int, host_id: str = "") -> None:
+        self._i_am_host = False
+        self._host_id = host_id or self.app.player_id
+        if self.current_tournament_id:
+            old_filter = f"naval/tournament/LOBBY/{self.current_tournament_id}/+"
+            self.app.client.message_callback_remove(old_filter)
+            self.app.client.unsubscribe(old_filter)
+            if self._my_lobby_topic:
+                self.app.client.publish(self._my_lobby_topic, b"", retain=True)
+            self.players.clear()
+            self._tournament_started = False
+
+        self.current_tournament_id = tournament_id
+        self.max_players = max_p
+        lobby_filter = f"naval/tournament/LOBBY/{tournament_id}/+"
+        self._my_lobby_topic = f"naval/tournament/LOBBY/{tournament_id}/{self.app.player_id}"
+
+        self.app.client.message_callback_add(lobby_filter, self._on_lobby_update)
+        self.app.client.subscribe(lobby_filter)
+        self.app.client.publish(self._my_lobby_topic, json.dumps({
+            "addr": self.app.my_addr
+        }), retain=True)
+        self.mode = "lobby"
+
+    def _on_lobby_update(self, client, userdata, msg) -> None:
+        pid = msg.topic.split("/")[-1]
+        payload = msg.payload.decode()
+        if not payload:
+            self.app.call_from_thread(self._update_lobby, pid, None)
+            return
+        try:
+            data = json.loads(payload)
+        except (json.JSONDecodeError, TypeError):
+            return
+        addr = data.get("addr")
+        if not addr:
+            return
+        self.app.call_from_thread(self._update_lobby, pid, addr)
+
+    def _update_lobby(self, pid: str, addr: str | None) -> None:
+        if addr is None:
+            self.players.pop(pid, None)
+        else:
+            self.players[pid] = addr
+        self._refresh()
+        # Only the host updates the headcount in the announcement (avoids races)
+        if self.current_tournament_id and not self._tournament_started and self._i_am_host:
+            self.app.client.publish(
+                f"naval/tournament/{self.current_tournament_id}",
+                json.dumps({
+                    "host":            self._host_id,
+                    "max_players":     self.max_players,
+                    "current_players": len(self.players),
+                }),
+                retain=True,
+            )
+        if len(self.players) == self.max_players and not self._tournament_started:
+            self._tournament_started = True
+            self.active_players = sorted(self.players.keys())
+            self.max_rounds     = {4: 2, 8: 3}.get(self.max_players, 3)
+            self.round          = 1
+            self.round_winners  = {}
+            # Close the lobby: stop processing late joiners and clear own presence
+            lobby_filter = f"naval/tournament/LOBBY/{self.current_tournament_id}/+"
+            self.app.client.message_callback_remove(lobby_filter)
+            self.app.client.unsubscribe(lobby_filter)
+            if self._my_lobby_topic:
+                self.app.client.publish(self._my_lobby_topic, b"", retain=True)
+            # Remove the open announcement so no new players can see/join it
+            if self._i_am_host:
+                self.app.client.publish(
+                    f"naval/tournament/{self.current_tournament_id}", b"", retain=True
+                )
+            self._run_tournament()
+
+    @work(exit_on_error=False)
+    async def _run_tournament(self) -> None:
+        try:
+            await self._tournament_loop()
+        except Exception as exc:
+            self.notify(f"Erro no torneio: {exc}", severity="error")
+            self.mode = "menu"
+
+    async def _tournament_loop(self) -> None:
+        while len(self.active_players) > 1:
+            self.round_winners = {}
+            self._round_event  = asyncio.Event()
+            round_initial      = list(self.active_players)
+
+            winner_filter = (
+                f"naval/tournament/{self.current_tournament_id}"
+                f"/winner/round{self.round}/+"
+            )
+            self.app.client.message_callback_add(winner_filter, self._on_winner_msg)
+            self.app.client.subscribe(winner_filter)
+
+            my_idx = self.active_players.index(self.app.player_id)
+            # BYE: odd player at the end (whole bracket disconnected upstream)
+            if my_idx % 2 == 0 and my_idx + 1 >= len(self.active_players):
+                match_winner = self.app.player_id
+                opponent_id  = None
+            else:
+                opponent_id = (
+                    self.active_players[my_idx + 1] if my_idx % 2 == 0
+                    else self.active_players[my_idx - 1]
+                )
+                match_winner = await self.app.init_p2p_game(
+                    opponent_id, self.current_tournament_id
+                )
+
+            if match_winner != self.app.player_id:
+                # Record what we know: we lost our match
+                self._record_round(round_initial, {opponent_id: True})
+                self.app.client.message_callback_remove(winner_filter)
+                self.app.client.unsubscribe(winner_filter)
+                self.mode = "eliminated"
+                return
+
+            win_topic = (
+                f"naval/tournament/{self.current_tournament_id}"
+                f"/winner/round{self.round}/{self.app.player_id}"
+            )
+            self.app.client.publish(
+                win_topic, json.dumps({"winner": self.app.player_id}), retain=True
+            )
+            self._register_winner(self.app.player_id)
+
+            self.mode = "waiting"
+            try:
+                await asyncio.wait_for(self._round_event.wait(), timeout=120.0)
+            except asyncio.TimeoutError:
+                pass  # proceed with whoever we have
+
+            self.app.client.message_callback_remove(winner_filter)
+            self.app.client.unsubscribe(winner_filter)
+
+            self._record_round(round_initial, self.round_winners)
+            self.round         += 1
+            self.active_players = sorted(self.round_winners.keys())
+            self.round_winners  = {}
+
+        self.mode = "champion"
+
+    # --- Gestão de Mensagens ---
+
+    def _on_winner_msg(self, client, userdata, msg) -> None:
+        pid     = msg.topic.split("/")[-1]
+        payload = msg.payload.decode()
+        if not payload:
+            return
+        try:
+            data = json.loads(payload)
+        except (json.JSONDecodeError, TypeError):
+            return
+        if data.get("winner") != pid:
+            return
+        self.app.call_from_thread(self._register_winner, pid)
+
+    def _register_winner(self, pid: str) -> None:
+        self.round_winners[pid] = True
+        self._refresh()
+        expected = (len(self.active_players) + 1) // 2  # ceil: handles odd count from BYEs
+        if len(self.round_winners) >= expected and self._round_event is not None:
+            self._round_event.set()
+
+    def _record_round(self, players: list[str], winners: dict) -> None:
+        pairs = []
+        for i in range(0, len(players) - 1, 2):
+            p1, p2 = players[i], players[i + 1]
+            winner = p1 if p1 in winners else (p2 if p2 in winners else None)
+            pairs.append((p1, p2, winner))
+        if len(players) % 2 == 1:
+            pairs.append((players[-1], None, players[-1]))  # BYE
+        self._bracket_history.append({"round": self.round, "pairs": pairs})
+        self._refresh()
 
     def _on_mqtt_message(self, client, userdata, msg) -> None:
-        tournament_id = msg.topic.split("/")[-1]
-        payload       = msg.payload.decode()
-        tournaments   = dict(self.available_tournaments)
+        # Only process top-level announcement topics: naval/tournament/{id}
+        # Deeper topics (LOBBY, winner, results) are handled by their own callbacks.
+        parts = msg.topic.split("/")
+        if len(parts) != 3:
+            return
+
+        tournament_id = parts[2]
+        payload = msg.payload.decode()
+        tournaments = dict(self.available_tournaments)
+
         if payload == "closed":
             tournaments.pop(tournament_id, None)
         else:
@@ -506,37 +756,124 @@ class MenuTorneioScreen(Screen):
                 pass
         self.app.call_from_thread(setattr, self, "available_tournaments", tournaments)
 
+    # --- UI & Actions ---
+
     def watch_available_tournaments(self, tournaments: dict) -> None:
         self._tourney_items = list(tournaments.items())
         self._refresh()
 
-    def watch_cursor(self)         -> None: self._refresh()
+    def watch_cursor(self)        -> None: self._refresh()
     def watch_tourney_cursor(self) -> None: self._refresh()
     def watch_mode(self)           -> None: self._refresh()
+
+    def _bracket_lines(self) -> list[str]:
+        if not self._bracket_history:
+            return []
+        lines = ["[bold]Resultado do torneio:[/]", ""]
+        for entry in self._bracket_history:
+            r        = entry["round"]
+            is_final = (r == self.max_rounds)
+            title    = "[bold]Final:[/]" if is_final else f"[bold]Ronda {r}:[/]"
+            lines.append(title)
+            for p1, p2, winner in entry["pairs"]:
+                me1 = " [yellow](tu)[/]" if p1 == self.app.player_id else ""
+                me2 = " [yellow](tu)[/]" if p2 == self.app.player_id else ""
+                if p2 is None:
+                    lines.append(f"  {p1}{me1}  — BYE  →  [green]{p1}[/]")
+                elif winner is None:
+                    lines.append(f"  {p1}{me1} vs {p2}{me2}  →  [dim]?[/]")
+                else:
+                    icon = " [bold yellow]🏆[/]" if is_final else " [green]✓[/]"
+                    lines.append(f"  {p1}{me1} vs {p2}{me2}  →  [green]{winner}[/]{icon}")
+            lines.append("")
+        return lines
 
     def _refresh(self) -> None:
         in_tourneys = self.mode == "tournaments"
         lines = ["\n[cyan]Torneio[/]\n"]
 
-        for i, opt in enumerate(self._OPTIONS):
-            if in_tourneys and i == 1:
-                prefix = "[yellow]►[/] "
-            elif not in_tourneys and i == self.cursor:
-                prefix = "[yellow]►[/] "
-            else:
-                prefix = "  "
-            lines.append(f"{prefix}[yellow]{i + 1}.[/] {opt}")
+        if self.mode == "lobby":
+            lines += [
+                "[bold]Lobby — a aguardar jogadores…[/]",
+                f"  [cyan]{len(self.players)}/{self.max_players}[/] prontos",
+                "",
+            ]
+            for pid in sorted(self.players):
+                tag = "[yellow](tu)[/]" if pid == self.app.player_id else "[green]●[/]"
+                lines.append(f"  {tag} {pid}")
+            lines += ["", "[dim]Esc para sair do lobby[/]"]
 
-        lines += ["", "[bold]Torneios disponíveis:[/]"]
-        if not self._tourney_items:
-            lines.append("  [dim]Nenhum torneio disponível[/]")
+        elif self.mode == "waiting":
+            lines += [
+                f"[bold]Ronda {self.round}/{self.max_rounds} — a aguardar resultados…[/]",
+                "",
+            ]
+            for i in range(0, len(self.active_players) - 1, 2):
+                p1, p2 = self.active_players[i], self.active_players[i + 1]
+                me1    = " [yellow](tu)[/]" if p1 == self.app.player_id else ""
+                me2    = " [yellow](tu)[/]" if p2 == self.app.player_id else ""
+                winner = p1 if p1 in self.round_winners else (p2 if p2 in self.round_winners else None)
+                status = f"[green]✓ {winner}[/]" if winner else "[dim]⏳ a jogar…[/]"
+                lines.append(f"  {p1}{me1} vs {p2}{me2}  —  {status}")
+            if len(self.active_players) % 2 == 1:
+                bye = self.active_players[-1]
+                tag = " [yellow](tu)[/]" if bye == self.app.player_id else ""
+                lines.append(f"  {bye}{tag}  — [dim]BYE (avança automaticamente)[/]")
+
+        elif self.mode == "creating":
+            lines += [
+                "[bold]Criar torneio[/]",
+                "",
+                "Prima [yellow]4[/] ou [yellow]8[/] para escolher o número de jogadores:",
+                "  [yellow]4[/] — 4 jogadores  (2 rondas)",
+                "  [yellow]8[/] — 8 jogadores  (3 rondas)",
+                "",
+                "[dim]Esc para cancelar[/]",
+            ]
+
+        elif self.mode == "eliminated":
+            lines += [
+                f"[red]Eliminado na ronda {self.round}/{self.max_rounds}.[/]",
+                "",
+            ]
+            lines += self._bracket_lines()
+            lines += ["[dim]Esc para voltar ao menu.[/]"]
+
+        elif self.mode == "champion":
+            lines += [
+                "[bold yellow]Campeão do torneio![/]",
+                "",
+            ]
+            lines += self._bracket_lines()
+            lines += ["[dim]Esc para voltar ao menu.[/]"]
+
         else:
-            for i, (_, t) in enumerate(self._tourney_items):
-                prefix = "[yellow]►[/] " if (in_tourneys and i == self.tourney_cursor) else "  "
-                slots  = f"{len(t.get('players', []))}/{t.get('max_players', 4)}"
-                lines.append(f"{prefix}[cyan]{t['host']}[/] [dim]({slots})[/]")
+            for i, opt in enumerate(self._OPTIONS):
+                prefix = "[yellow]►[/] " if (not in_tourneys and i == self.cursor) else "  "
+                lines.append(f"{prefix}[yellow]{i + 1}.[/] {opt}")
+
+            lines += ["", "[bold]Torneios disponíveis:[/]"]
+            if not self._tourney_items:
+                lines.append("  [dim]Nenhum torneio disponível[/]")
+            else:
+                for i, (tid, t) in enumerate(self._tourney_items):
+                    prefix = "[yellow]►[/] " if (in_tourneys and i == self.tourney_cursor) else "  "
+                    slots  = f"{t.get('current_players', 0)}/{t.get('max_players', 4)}"
+                    lines.append(f"{prefix}[cyan]{t.get('host', '?')}[/] [dim]({slots})[/]")
 
         self.query_one("#display", Static).update("\n".join(lines))
+
+    def action_select(self) -> None:
+        if self.mode == "tournaments":
+            if self._tourney_items:
+                tid, data = self._tourney_items[self.tourney_cursor]
+                self.join_tournament(tid, data.get("max_players", 4), host_id=data.get("host", ""))
+        elif self.cursor == 0:
+            self.mode = "creating"
+        else:
+            # Entrar em torneio (muda o modo para listar torneios disponíveis)
+            self.mode = "tournaments"
+            self.tourney_cursor = 0
 
     def action_cursor_up(self) -> None:
         if self.mode == "tournaments":
@@ -550,42 +887,63 @@ class MenuTorneioScreen(Screen):
         else:
             self.cursor = min(len(self._OPTIONS) - 1, self.cursor + 1)
 
-    def action_select(self) -> None:
-        if self.mode == "tournaments":
-            pass  # TODO (P2): bracket join logic
-        elif self.cursor == 0:
-            inp = self.query_one("#max_input", Input)
-            inp.display = True
-            inp.focus()
-        else:
-            self.mode = "tournaments"
-            self.tourney_cursor = 0
+    # (action_select already implemented above; duplicate removed)
 
     def action_back(self) -> None:
-        if self.mode == "tournaments":
+        if self.mode == "waiting":
+            return  # comprometido com o torneio — não pode sair a meio da ronda
+        elif self.mode == "creating":
+            self.mode = "menu"
+        elif self.mode == "tournaments":
+            self.mode = "menu"
+        elif self.mode == "lobby":
+            tid = self.current_tournament_id
+            if tid:
+                lobby_filter = f"naval/tournament/LOBBY/{tid}/+"
+                self.app.client.message_callback_remove(lobby_filter)
+                self.app.client.unsubscribe(lobby_filter)
+                if self._my_lobby_topic:
+                    self.app.client.publish(self._my_lobby_topic, b"", retain=True)
+                if self._i_am_host:
+                    self.app.client.publish(f"naval/tournament/{tid}", b"", retain=True)
+            self.players.clear()
+            self._tournament_started = False
+            self._i_am_host = False
+            self.current_tournament_id = None
+            self._my_lobby_topic = None
+            self.mode = "menu"
+        elif self.mode in ("eliminated", "champion"):
+            self.active_players      = []
+            self.round               = 1
+            self.max_rounds          = 0
+            self.round_winners       = {}
+            self._round_event        = None
+            self._tournament_started = False
+            self._bracket_history    = []
+            self.players.clear()
+            self.current_tournament_id = None
+            self._my_lobby_topic       = None
             self.mode = "menu"
         else:
             self.app.pop_screen()
 
-    @on(Input.Submitted, "#max_input")
-    def on_max_players(self, event: Input.Submitted) -> None:
-        val = event.value.strip()
-        inp = self.query_one("#max_input", Input)
-        inp.display = False
-        inp.value   = ""
-        if val not in ("4", "8"):
-            return
+    def on_key(self, event) -> None:
+        if self.mode == "creating" and event.key in ("4", "8"):
+            event.stop()
+            self._create_tournament(int(event.key))
+
+    def _create_tournament(self, max_players: int) -> None:
         tournament_id = str(uuid.uuid4())
         self.app.client.publish(
             f"naval/tournament/{tournament_id}",
             json.dumps({
                 "host":        self.app.player_id,
-                "addr":        self.app.my_addr,
-                "max_players": int(val),
-                "players":     [self.app.player_id],
+                "max_players": max_players,
             }),
             retain=True,
         )
+        self.join_tournament(tournament_id, max_players, host_id=self.app.player_id)
+        self._i_am_host = True  # must be set after join_tournament (which resets it)
 
 
 # ── GameScreen ────────────────────────────────────────────────────
@@ -608,6 +966,8 @@ class GameScreen(Screen):
         is_host:      bool,
         addr_or_port,
         server_info   = None,
+        opponent_id:   Optional[str] = None,
+
     ) -> None:
         super().__init__()
         self.player_id    = player_id
@@ -619,6 +979,8 @@ class GameScreen(Screen):
         self.game_ui      = GameUI()
         self.tracking:    dict[tuple, str] = {}
         self._game_ended  = False
+        self._winner:     str | None = None
+        self.opponent_id  = opponent_id
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
@@ -681,29 +1043,50 @@ class GameScreen(Screen):
     def on_key(self, event) -> None:
         if self._game_ended and event.key == "enter":
             event.stop()
-            self.dismiss()
+            self.dismiss(self._winner)
 
-    def _end_game(self) -> None:
+    def _end_game(self, winner: Optional[str]) -> None:
         self._game_ended = True
+        self._winner = winner
         self.query_one("#attack_input", Input).disabled = True
-        self.query_one("#log", RichLog).write(
-            "[dim]Prima Enter para voltar ao menu principal.[/]"
-        )
 
-    @work(exclusive=True)
+        if winner == self.player_id:
+            self.report_victory(self.player_id, self.opponent_id)
+            self.query_one("#log", RichLog).write("[bold green]Vitória! Resultado reportado.[/]")
+        elif winner is None:
+            self.query_one("#log", RichLog).write("[dim]Partida terminada.[/]")
+        else:
+            self.query_one("#log", RichLog).write("[bold red]Derrota.[/]")
+
+        self.query_one("#log", RichLog).write("[dim]Prima Enter para voltar ao menu.[/]")
+
+    def report_victory(self, winner_id: str, loser_id: str):
+        result_topic = f"naval/results/{self.game_id}"
+        self.app.client.publish(result_topic, json.dumps({
+            "winner": winner_id,
+            "loser": loser_id,
+        }), retain=True)
+
+    @work(exclusive=True, exit_on_error=False)
     async def _run_host(self) -> None:
-        await run_as_host(
-            self.player_id, self.game_id, self.addr_or_port, self.my_board, self.game_ui,
-            server_info=self.server_info,
-        )
-        self._end_game()
+        try:
+            winner = await run_as_host(
+                self.player_id, self.game_id, self.addr_or_port, self.my_board, self.game_ui,
+                server_info=self.server_info,
+            )
+        except Exception:
+            winner = self.player_id  # unhandled error: we're still here → we win
+        self.call_later(self._end_game, winner)
 
-    @work(exclusive=True)
+    @work(exclusive=True, exit_on_error=False)
     async def _run_guest(self) -> None:
-        await run_as_guest(
-            self.player_id, self.game_id, self.addr_or_port, self.my_board, self.game_ui
-        )
-        self._end_game()
+        try:
+            winner = await run_as_guest(
+                self.player_id, self.game_id, self.addr_or_port, self.my_board, self.game_ui
+            )
+        except Exception:
+            winner = self.player_id  # unhandled error: we're still here → we win
+        self.call_later(self._end_game, winner)
 
 
 # ── App ───────────────────────────────────────────────────────────
@@ -714,6 +1097,74 @@ class BatalhaNavalApp(App):
     my_addr:      str         = ""
     client:       mqtt.Client = None
     _game_topics: set         = set()  # retained topics we published; cleared on exit
+
+    async def init_p2p_game(self, opponent_id: str, tournament_id: str) -> str | None:
+        """Run one tournament match. Host binds a fresh random port and advertises
+        it via MQTT; guest waits for that address before connecting."""
+        is_host = self.player_id < opponent_id
+        game_id = f"{min(self.player_id, opponent_id)}-{max(self.player_id, opponent_id)}"
+        game_topic = f"naval/tournament/{tournament_id}/game/{game_id}"
+
+        if is_host:
+            # Fresh random port every match — same pattern as 1v1 host
+            server_info = await start_host_server(0)
+            server, _   = server_info
+            actual_port = server.sockets[0].getsockname()[1]
+            actual_addr = f"{get_local_ip()}:{actual_port}"
+            self.client.publish(game_topic, json.dumps({"addr": actual_addr}), retain=True)
+
+            my_board = await self.push_screen_wait(PlacementScreen())
+            winner   = await self.push_screen_wait(GameScreen(
+                player_id=self.player_id, game_id=game_id, my_board=my_board,
+                is_host=True, addr_or_port=actual_port, server_info=server_info,
+                opponent_id=opponent_id,
+            ))
+            self.client.publish(game_topic, b"", retain=True)   # clean up after game
+            # None means guest never connected (timed out) → we win by default
+            return winner if winner is not None else self.player_id
+        else:
+            # Wait for host to publish their actual TCP address, then connect
+            host_addr = await self._wait_game_addr(game_topic)
+            if host_addr is None:
+                # Host never showed up → guest wins by default (no game needed)
+                return self.player_id
+
+            my_board = await self.push_screen_wait(PlacementScreen())
+            winner   = await self.push_screen_wait(GameScreen(
+                player_id=self.player_id, game_id=game_id, my_board=my_board,
+                is_host=False, addr_or_port=host_addr, opponent_id=opponent_id,
+            ))
+            # None means connection failed mid-game → we're still here → we win
+            return winner if winner is not None else self.player_id
+
+    async def _wait_game_addr(self, topic: str, timeout: float = 60.0) -> str | None:
+        """Subscribe to `topic` and return the host's TCP address once published.
+        Returns None if the host never appears within `timeout` seconds."""
+        ready   = asyncio.Event()
+        box: list[str | None] = [None]
+
+        def _cb(client, userdata, msg):
+            payload = msg.payload.decode()
+            if not payload:
+                return
+            try:
+                addr = json.loads(payload).get("addr")
+                if addr:
+                    box[0] = addr
+                    self.call_from_thread(ready.set)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        self.client.message_callback_add(topic, _cb)
+        self.client.subscribe(topic)
+        try:
+            await asyncio.wait_for(ready.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            self.client.message_callback_remove(topic)
+            self.client.unsubscribe(topic)
+        return box[0]
 
     def on_mount(self) -> None:
         self.push_screen(SetupScreen())
