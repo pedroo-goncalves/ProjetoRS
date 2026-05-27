@@ -21,6 +21,7 @@ from textual import on, work
 
 from network.tcp_game import run_as_host, run_as_guest, GameUI, start_host_server
 from network.preparation import PlacementScreen
+from network.chat_mesh import ChatMesh
 from game.board import Board, GRID_SIZE
 from game.types import Cell
 
@@ -485,6 +486,8 @@ class MenuTorneioScreen(Screen):
     MenuTorneioScreen { align: center middle; }
     #display   { margin-bottom: 1; }
     #max_input { width: 30; border: tall $panel; padding: 0 1; }
+    #chat_log  { height: 8; border: solid $accent; width: 60; display: none; }
+    #chat_input { width: 60; display: none; }
     """
 
     BINDINGS = [
@@ -523,13 +526,21 @@ class MenuTorneioScreen(Screen):
     
     def compose(self) -> ComposeResult:
         yield Static("", id="display")
+        yield RichLog(id="chat_log", markup=True, highlight=False)
+        yield Input(placeholder="Mensagem de chat…", id="chat_input", disabled=True)
 
     def on_mount(self) -> None:
         self.app.client.message_callback_add("naval/tournament/#", self._on_mqtt_message)
         self.app.client.subscribe("naval/tournament/#")
+        # RichLog is scrollable and would auto-focus on mount; prevent it from stealing keys
+        self.query_one("#chat_log").can_focus = False
         self._refresh()
+        self.set_focus(None)
 
     def on_unmount(self) -> None:
+        if self.app.chat_mesh:
+            asyncio.create_task(self.app.chat_mesh.stop())
+            self.app.chat_mesh = None
         self.app.client.message_callback_remove("naval/tournament/#")
         self.app.client.unsubscribe("naval/tournament/#")
         tid = self.current_tournament_id
@@ -577,6 +588,10 @@ class MenuTorneioScreen(Screen):
             self.players.clear()
             self._tournament_started = False
 
+        if self.app.chat_mesh:
+            asyncio.create_task(self.app.chat_mesh.stop())
+            self.app.chat_mesh = None
+
         self.current_tournament_id = tournament_id
         self.max_players = max_p
         lobby_filter = f"naval/tournament/LOBBY/{tournament_id}/+"
@@ -587,6 +602,13 @@ class MenuTorneioScreen(Screen):
         self.app.client.publish(self._my_lobby_topic, json.dumps({
             "addr": self.app.my_addr
         }), retain=True)
+
+        self.app.chat_mesh = ChatMesh(self.app.player_id, tournament_id)
+        self.app.chat_mesh.on_message = lambda sid, txt: self.call_later(
+            self._on_chat_message, sid, txt
+        )
+        asyncio.create_task(self.app.chat_mesh.start())
+
         self.mode = "lobby"
 
     def _on_lobby_update(self, client, userdata, msg) -> None:
@@ -869,6 +891,45 @@ class MenuTorneioScreen(Screen):
                     lines.append(f"{prefix}[cyan]{t.get('host', '?')}[/] [dim]({slots})[/]")
 
         self.query_one("#display", Static).update("\n".join(lines))
+        show_chat  = self.mode in ("lobby", "waiting", "eliminated", "champion")
+        chat_ready = show_chat and self.app.chat_mesh is not None
+        try:
+            self.query_one("#chat_log").display = show_chat
+            inp = self.query_one("#chat_input", Input)
+            had_focus = inp.has_focus  # check BEFORE hiding; display=False clears has_focus
+            inp.display  = show_chat
+            inp.disabled = not chat_ready
+            if not show_chat:
+                # returning to menu/creating/tournaments — always clear any lingering focus
+                self.set_focus(None)
+            elif had_focus and not chat_ready:
+                self.set_focus(None)
+        except Exception:
+            pass
+
+    def _rewire_chat(self) -> None:
+        """Re-attach MenuTorneioScreen's on_message handler after GameScreen clears it."""
+        if self.app.chat_mesh:
+            self.app.chat_mesh.on_message = lambda sid, txt: self.call_later(
+                self._on_chat_message, sid, txt
+            )
+
+    def _on_chat_message(self, sender_id: str, text: str) -> None:
+        try:
+            self.query_one("#chat_log", RichLog).write(f"[cyan]{sender_id}:[/] {text}")
+        except Exception:
+            pass
+
+    @on(Input.Submitted, "#chat_input")
+    def on_chat(self, event: Input.Submitted) -> None:
+        text = event.value.strip()
+        if not text or not self.app.chat_mesh:
+            return
+        asyncio.create_task(self.app.chat_mesh.send_all(text))
+        self.query_one("#chat_log", RichLog).write(
+            f"[yellow]{self.app.player_id}:[/] {text}"
+        )
+        self.query_one("#chat_input", Input).value = ""
 
     def action_select(self) -> None:
         if self.mode == "tournaments":
@@ -916,6 +977,9 @@ class MenuTorneioScreen(Screen):
                     self.app.client.publish(self._my_lobby_topic, b"", retain=True)
                 if self._i_am_host:
                     self.app.client.publish(f"naval/tournament/{tid}", b"", retain=True)
+            if self.app.chat_mesh:
+                asyncio.create_task(self.app.chat_mesh.stop())
+                self.app.chat_mesh = None
             self.players.clear()
             self._tournament_started = False
             self._i_am_host = False
@@ -967,8 +1031,10 @@ class GameScreen(Screen):
     GameScreen      { layout: vertical; }
     ContentSwitcher { height: 1fr; }
     #attack, #waiting { padding: 1 2; }
-    #log            { height: 10; border: solid $primary; }
+    #log            { height: 8; border: solid $primary; }
     #attack_input   { width: 40; margin-top: 1; }
+    #chat_log       { height: 6; border: solid $accent; }
+    #chat_input     { }
     """
 
     def __init__(
@@ -979,8 +1045,8 @@ class GameScreen(Screen):
         is_host:      bool,
         addr_or_port,
         server_info   = None,
-        opponent_id:   Optional[str] = None,
-
+        opponent_id:  Optional[str] = None,
+        chat_mesh:    Optional[ChatMesh] = None,
     ) -> None:
         super().__init__()
         self.player_id    = player_id
@@ -994,6 +1060,7 @@ class GameScreen(Screen):
         self._game_ended  = False
         self._winner:     str | None = None
         self.opponent_id  = opponent_id
+        self.chat_mesh    = chat_mesh
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
@@ -1009,16 +1076,33 @@ class GameScreen(Screen):
             disabled=True,
         )
         yield RichLog(id="log", markup=True, highlight=False)
+        yield RichLog(id="chat_log", markup=True, highlight=False)
+        yield Input(placeholder="Chat…", id="chat_input")
         yield Footer()
 
     def on_mount(self) -> None:
         self.title = f"Batalha Naval — {self.player_id}"
         self._wire_ui()
         self._render_boards()
+        if self.chat_mesh:
+            # Save the existing handler (MenuTorneioScreen's) so on_unmount can restore it.
+            self._chat_prev_handler = self.chat_mesh.on_message
+            self.chat_mesh.on_message = lambda sid, txt: self.call_later(
+                self._on_chat_message, sid, txt
+            )
+        else:
+            self.query_one("#chat_log").display  = False
+            self.query_one("#chat_input").display = False
         if self.is_host:
             self._run_host()
         else:
             self._run_guest()
+
+    def on_unmount(self) -> None:
+        if self.chat_mesh:
+            # Restore whatever handler was active before this screen mounted.
+            # Setting None would race with _rewire_chat(); restoring exactly what we saved is safe.
+            self.chat_mesh.on_message = self._chat_prev_handler
 
     def _wire_ui(self) -> None:
         ui = self.game_ui
@@ -1045,6 +1129,23 @@ class GameScreen(Screen):
     def _render_boards(self) -> None:
         self.query_one("#tracking_board",   Static).update(_render_tracking(self.tracking))
         self.query_one("#my_board_display", Static).update(_render_my_board(self.my_board))
+
+    def _on_chat_message(self, sender_id: str, text: str) -> None:
+        try:
+            self.query_one("#chat_log", RichLog).write(f"[cyan]{sender_id}:[/] {text}")
+        except Exception:
+            pass
+
+    @on(Input.Submitted, "#chat_input")
+    def on_chat(self, event: Input.Submitted) -> None:
+        text = event.value.strip()
+        if not text or not self.chat_mesh:
+            return
+        asyncio.create_task(self.chat_mesh.send_all(text))
+        self.query_one("#chat_log", RichLog).write(
+            f"[yellow]{self.player_id}:[/] {text}"
+        )
+        self.query_one("#chat_input", Input).value = ""
 
     @on(Input.Submitted, "#attack_input")
     def on_attack(self, event: Input.Submitted) -> None:
@@ -1106,10 +1207,11 @@ class GameScreen(Screen):
 
 class BatalhaNavalApp(App):
 
-    player_id:    str         = ""
-    my_addr:      str         = ""
-    client:       mqtt.Client = None
-    _game_topics: set         = set()  # retained topics we published; cleared on exit
+    player_id:    str              = ""
+    my_addr:      str              = ""
+    client:       mqtt.Client      = None
+    _game_topics: set              = set()
+    chat_mesh:    ChatMesh | None  = None
 
     async def init_p2p_game(self, opponent_id: str, tournament_id: str) -> str | None:
         """Run one tournament match. Host binds a fresh random port and advertises
@@ -1130,7 +1232,7 @@ class BatalhaNavalApp(App):
             winner   = await self.push_screen_wait(GameScreen(
                 player_id=self.player_id, game_id=game_id, my_board=my_board,
                 is_host=True, addr_or_port=actual_port, server_info=server_info,
-                opponent_id=opponent_id,
+                opponent_id=opponent_id, chat_mesh=self.chat_mesh,
             ))
             self.client.publish(game_topic, b"", retain=True)   # clean up after game
             # None means guest never connected (timed out) → we win by default
@@ -1146,6 +1248,7 @@ class BatalhaNavalApp(App):
             winner   = await self.push_screen_wait(GameScreen(
                 player_id=self.player_id, game_id=game_id, my_board=my_board,
                 is_host=False, addr_or_port=host_addr, opponent_id=opponent_id,
+                chat_mesh=self.chat_mesh,
             ))
             # None means connection failed mid-game → we're still here → we win
             return winner if winner is not None else self.player_id
