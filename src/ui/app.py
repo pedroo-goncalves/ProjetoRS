@@ -1,6 +1,7 @@
 import json
 import re
 import uuid
+from datetime import datetime
 from typing import Optional
 import socket
 import asyncio
@@ -129,7 +130,7 @@ class SetupScreen(Screen):
             error.update("Só são permitidas letras (a-z) e números (0-9).")
             return
         error.update("")
-        self.app.player_id = name
+        self.app.player_id = f"{name}_{datetime.now().strftime('%H%M%S%f')}"
         self.app.my_addr   = f"{get_local_ip()}:{find_free_port()}"
         self.app.setup_mqtt()
         self.app.push_screen(MainMenuScreen())
