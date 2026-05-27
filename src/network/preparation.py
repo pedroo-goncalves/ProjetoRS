@@ -1,4 +1,5 @@
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.screen import Screen
 from textual.widgets import Static, Footer, Header
 from textual.reactive import reactive
@@ -29,10 +30,10 @@ class PlacementScreen(Screen):
     """
 
     BINDINGS = [
-        ("up",    "move_up",    "Cima"),
-        ("down",  "move_down",  "Baixo"),
-        ("left",  "move_left",  "Esquerda"),
-        ("right", "move_right", "Direita"),
+        Binding("up",    "move_up",    "Cima",      priority=True),
+        Binding("down",  "move_down",  "Baixo",     priority=True),
+        Binding("left",  "move_left",  "Esquerda",  priority=True),
+        Binding("right", "move_right", "Direita",   priority=True),
         ("r",     "rotate",     "Rodar"),
         ("enter", "place",      "Colocar"),
     ]

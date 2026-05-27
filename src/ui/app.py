@@ -7,6 +7,7 @@ import sys
 import paho.mqtt.client as mqtt
 
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.screen import Screen
 from textual.widgets import (
     Static, Header, Footer, Input,
@@ -609,10 +610,10 @@ class GameScreen(Screen):
     """
 
     BINDINGS = [
-        ("up",    "cursor_up",    ""),
-        ("down",  "cursor_down",  ""),
-        ("left",  "cursor_left",  ""),
-        ("right", "cursor_right", ""),
+        Binding("up",    "cursor_up",    "", priority=True),
+        Binding("down",  "cursor_down",  "", priority=True),
+        Binding("left",  "cursor_left",  "", priority=True),
+        Binding("right", "cursor_right", "", priority=True),
         ("enter", "fire",         "Atacar"),
         ("r",     "surrender",    "Render"),
     ]
