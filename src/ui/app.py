@@ -304,6 +304,9 @@ class Menu1v1Screen(Screen):
 
     @work
     async def _join(self, idx: int) -> None:
+        if not self.app.broker_ok():
+            self.notify("O broker não se encontra ativo.", severity="error")
+            return
         if idx >= len(self._game_items):
             return
         game_id, game = self._game_items[idx]
@@ -320,6 +323,9 @@ class Menu1v1Screen(Screen):
 
     @work
     async def _criar(self) -> None:
+        if not self.app.broker_ok():
+            self.notify("O broker não se encontra ativo.", severity="error")
+            return
         game_id     = str(uuid.uuid4())
         server_info = await start_host_server(0)
         server, _   = server_info
@@ -866,6 +872,9 @@ class MenuTorneioScreen(Screen):
     def action_select(self) -> None:
         if self.mode == "tournaments":
             if self._tourney_items:
+                if not self.app.broker_ok():
+                    self.notify("O broker não se encontra ativo.", severity="error")
+                    return
                 tid, data = self._tourney_items[self.tourney_cursor]
                 self.join_tournament(tid, data.get("max_players", 4), host_id=data.get("host", ""))
         elif self.cursor == 0:
@@ -933,6 +942,9 @@ class MenuTorneioScreen(Screen):
             self._create_tournament(int(event.key))
 
     def _create_tournament(self, max_players: int) -> None:
+        if not self.app.broker_ok():
+            self.notify("O broker não se encontra ativo.", severity="error")
+            return
         tournament_id = str(uuid.uuid4())
         self.app.client.publish(
             f"naval/tournament/{tournament_id}",
@@ -1168,6 +1180,9 @@ class BatalhaNavalApp(App):
 
     def on_mount(self) -> None:
         self.push_screen(SetupScreen())
+
+    def broker_ok(self) -> bool:
+        return self.client is not None and self.client.is_connected()
 
     def setup_mqtt(self) -> None:
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, self.player_id)
