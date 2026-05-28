@@ -655,6 +655,13 @@ class MenuTorneioScreen(Screen):
             self.players.pop(pid, None)
         else:
             self.players[pid] = addr
+
+        # If the host left, elect the player with the smallest ID as new host
+        if addr is None and pid == self._host_id and self.players and not self._tournament_started:
+            self._host_id = min(self.players.keys())
+            if self._host_id == self.app.player_id:
+                self._i_am_host = True
+
         self._refresh()
         # Only the host updates the headcount in the announcement (avoids races)
         if self.current_tournament_id and not self._tournament_started and self._i_am_host:
