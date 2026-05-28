@@ -228,19 +228,19 @@ class Menu1v1Screen(Screen):
 
     def on_mount(self) -> None:
         self._game_items: list[tuple[str, dict]] = []
-        self.app.client.message_callback_add("naval/games/#", self._on_mqtt_message)
-        self.app.client.subscribe("naval/games/#")
+        self.app.client.message_callback_add("naval/games/+", self._on_mqtt_message)
+        self.app.client.subscribe("naval/games/+")
         self._refresh()
 
     def on_unmount(self) -> None:
-        self.app.client.message_callback_remove("naval/games/#")
-        self.app.client.unsubscribe("naval/games/#")
+        self.app.client.message_callback_remove("naval/games/+")
+        self.app.client.unsubscribe("naval/games/+")
 
     def _on_mqtt_message(self, client, userdata, msg) -> None:
         game_id = msg.topic.split("/")[-1]
         payload = msg.payload.decode()
         games   = dict(self.available_games)
-        if payload == "closed":
+        if not payload:
             games.pop(game_id, None)
         else:
             try:
@@ -321,7 +321,7 @@ class Menu1v1Screen(Screen):
         if idx >= len(self._game_items):
             return
         game_id, game = self._game_items[idx]
-        self.app.client.publish(f"naval/games/{game_id}", "closed", retain=True)
+        self.app.client.publish(f"naval/games/{game_id}", b"", retain=True)
         self.app._game_topics.discard(f"naval/games/{game_id}")
         my_board = await self.app.push_screen_wait(PlacementScreen())
         await self.app.push_screen_wait(GameScreen(
@@ -358,6 +358,8 @@ class Menu1v1Screen(Screen):
             addr_or_port = actual_port,
             server_info  = server_info,
         ))
+        self.app.client.publish(topic, b"", retain=True)
+        self.app._game_topics.discard(topic)
 
 
 # ── MatchmakingScreen ─────────────────────────────────────────────
@@ -387,6 +389,8 @@ class MatchmakingScreen(Screen):
     def on_unmount(self) -> None:
         self.app.client.message_callback_remove("naval/matchmaking/+")
         self.app.client.unsubscribe("naval/matchmaking/+")
+        self.app.client.message_callback_remove("naval/players/+")
+        self.app.client.unsubscribe("naval/players/+")
 
     def watch_status(self, val: str) -> None:
         self.query_one("#mm_status", Static).update(val)
@@ -400,6 +404,10 @@ class MatchmakingScreen(Screen):
         if data is not None:
             self._queue[sender_id] = data["addr"]
 
+    def _handle_presence_message(self, player_id: str, status: str) -> None:
+        if status in ("lost", "offline"):
+            self._queue.pop(player_id, None)
+
     def _on_mqtt_message(self, client, userdata, msg) -> None:
         sender_id = msg.topic.split("/")[-1]
         payload   = msg.payload.decode()
@@ -411,6 +419,11 @@ class MatchmakingScreen(Screen):
         except json.JSONDecodeError:
             return
         self.app.call_from_thread(self._handle_matchmaking_message, sender_id, data)
+
+    def _on_presence_message(self, client, userdata, msg) -> None:
+        player_id = msg.topic.split("/")[-1]
+        status    = msg.payload.decode()
+        self.app.call_from_thread(self._handle_presence_message, player_id, status)
 
     @work(exit_on_error=False)
     async def _search(self) -> None:
@@ -426,6 +439,8 @@ class MatchmakingScreen(Screen):
 
         self.app.client.message_callback_add("naval/matchmaking/+", self._on_mqtt_message)
         self.app.client.subscribe("naval/matchmaking/+")
+        self.app.client.message_callback_add("naval/players/+", self._on_presence_message)
+        self.app.client.subscribe("naval/players/+")
         self.app.client.publish(
             f"naval/matchmaking/{player_id}",
             json.dumps({"player_id": player_id, "addr": my_addr}),
@@ -1326,6 +1341,7 @@ class BatalhaNavalApp(App):
 
     def setup_mqtt(self) -> None:
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, self.player_id)
+        self.client.will_set(f"naval/players/{self.player_id}", "lost", retain=True)
         self.client.connect(BROKER, PORT_MQTT)
         self.client.loop_start()
         self.client.publish(f"naval/players/{self.player_id}", "online", retain=True)
